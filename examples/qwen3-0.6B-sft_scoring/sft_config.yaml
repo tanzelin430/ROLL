@@ -1,0 +1,72 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "qwen3-0.6B-sft-scoring"
+seed: 42
+logging_dir: ./output_sft_scoring/logs
+output_dir: ./output_sft_scoring
+
+# Wandb tracking (offline mode)
+track_with: wandb
+tracker_kwargs:
+  entity: tanzl-ustc
+  project: psro-math
+  mode: offline
+
+num_gpus_per_node: 2
+
+save_steps: 100
+logging_steps: 1
+eval_steps: 10
+resume_from_checkpoint: false
+
+# 93% of training data fits within 10240 tokens
+sequence_length: 12288
+
+# Model path
+pretrain: /mnt/shared-storage-user/ma4agi-gpu/data/model/Qwen3-0.6B
+
+# SFT data keys
+prompt_key: instruction
+query_key: input
+response_key: output
+
+# Validation dataset (disabled for now - causes OOM)
+# validation:
+#   data_args:
+#     file_name: /home/tanzelin-p/PSRO4math/PSRO-datasets/sft_scoring_eval.json
+#     template: qwen3
+
+# SFT training config
+sft_train:
+  model_args:
+    dtype: bf16
+  training_args:
+    num_train_epochs: 3
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 16
+    learning_rate: 1.0e-5
+  data_args:
+    file_name: /home/tanzelin-p/PSRO4math/PSRO-datasets/sft_scoring_train.json
+    template: qwen3
+    preprocessing_num_workers: null
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config:
+      train_micro_batch_size_per_gpu: auto
+      bf16:
+        enabled: true
+      zero_optimization:
+        stage: 2
+        allgather_partitions: true
+        allgather_bucket_size: 1.0e+9
+        overlap_comm: true
+        reduce_scatter: true
+        reduce_bucket_size: 5.0e+8
+        contiguous_gradients: true
+      gradient_clipping: 1.0
+  use_sequence_packing: false
+  device_mapping: list(range(0,2))
+  infer_batch_size: 2

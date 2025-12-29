@@ -6,6 +6,7 @@ import ray
 import torch
 from codetiming import Timer
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from roll.datasets.chat_template import get_chat_template
 from roll.datasets.collator import DataCollatorForSFT
@@ -181,11 +182,14 @@ class SFTPipeline(BasePipeline):
     def run(self):
         global_step = 0
         metrics_mgr = MetricsManager()
+        num_epochs = self.pipeline_config.sft_train.training_args.num_train_epochs
+        total_steps = num_epochs * len(self.dataloader)
 
-        for epoch in range(self.pipeline_config.sft_train.training_args.num_train_epochs):
+        for epoch in range(num_epochs):
             logger.info(f"epoch {epoch} start...")
 
-            for batch_dict in self.dataloader:
+            pbar = tqdm(self.dataloader, desc=f"Epoch {epoch}/{num_epochs}")
+            for batch_dict in pbar:
                 # for continual training
                 if global_step <= self.state.step:
                     global_step += 1
@@ -213,6 +217,10 @@ class SFTPipeline(BasePipeline):
                 metrics = metrics_mgr.get_metrics()
                 metrics = {k: float(v) for k, v in metrics.items()}
                 logger.info(f"metrics: {metrics}")
+
+                # Update tqdm progress bar
+                loss = metrics.get("sft_train/loss", 0)
+                pbar.set_postfix({"loss": f"{loss:.4f}", "step": f"{global_step}/{total_steps}"})
                 
                 self.state.step = global_step
                 self.state.log_history.append(metrics)

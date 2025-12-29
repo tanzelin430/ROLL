@@ -68,4 +68,6 @@ class SFTWorker(Worker):
 
     def loss_func(self, data: DataProto, output_tensor: torch.Tensor):
         labels = data.batch["labels"]
-        return self.strategy.op_compute_language_loss(output_tensor, labels)
+        loss, _ = self.strategy.op_compute_language_loss_from_logits(output_tensor, labels)
+        metrics = {f"{self.worker_config.name}/loss": loss.detach().float().unsqueeze(0)}
+        return loss, metrics
