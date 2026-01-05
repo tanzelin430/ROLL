@@ -126,6 +126,7 @@ class SFTPipeline(BasePipeline):
             max_length=self.pipeline_config.sequence_length,
             padded_keys=["input_ids", "attention_mask"],
             label_pad_token_id=IGNORE_INDEX,
+            shift_feature=False,  # IMPORTANT: loss func already does shift
         )
 
         self.pipeline_config.set_max_steps(
@@ -153,7 +154,7 @@ class SFTPipeline(BasePipeline):
         self.dataloader = DataLoader(
             dataset=self.dataset,
             batch_size=global_train_batch_size,
-            shuffle=False,
+            shuffle=True,  # Enable shuffle for better training
             drop_last=True,
             num_workers=self.pipeline_config.sft_train.training_args.dataloader_num_workers,
             collate_fn=data_collator,

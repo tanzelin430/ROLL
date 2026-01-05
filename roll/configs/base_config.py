@@ -82,6 +82,10 @@ class BaseConfig:
         default=50,
         metadata={"help": "Save checkpoint every X update steps."}
     )
+    max_ckpt_to_keep: int = field(
+        default=0,
+        metadata={"help": "Maximum number of checkpoints to keep. 0 means keep all checkpoints."}
+    )
     logging_steps: int = field(
         default=1,
         metadata={"help": "Number of steps between logging information."}
