@@ -28,6 +28,7 @@ from roll.utils.collective import collective
 from roll.utils.context_parallel import get_ulysses_group, set_upg_manager
 from roll.utils.deepspeed_utils import get_optimizer_grouped_parameters
 from roll.utils.functionals import append_to_dict, entropy_from_logits, log_probs_from_logits
+from roll.utils.constants import IGNORE_INDEX
 from roll.utils.logging import get_logger
 from roll.utils.offload_states import OffloadStateType
 from roll.platforms import current_platform
@@ -397,6 +398,31 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
 
         logger.info(f"{self.model}")
         dist.barrier()
+
+    def op_compute_language_loss(self, logits: torch.Tensor, labels: torch.Tensor):
+        """
+        Override for DeepSpeed strategy: compute language loss from logits.
+
+        In DeepSpeed strategy with HuggingFace models, the model returns logits
+        (not loss like in Megatron strategy where labels are passed to the model).
+
+        Note: DataCollatorForSFT already shifts labels (shift_feature=True by default),
+        so logits and labels are already aligned. Do NOT shift again here.
+
+        Args:
+            logits: Model output logits [batch_size, seq_len, vocab_size]
+            labels: Pre-shifted labels [batch_size, seq_len], already aligned with logits
+
+        Returns:
+            loss: Scalar loss tensor
+        """
+        # Labels already shifted by DataCollator, directly compute cross-entropy
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+            ignore_index=IGNORE_INDEX
+        )
+        return loss
 
     def train_step(
         self,
