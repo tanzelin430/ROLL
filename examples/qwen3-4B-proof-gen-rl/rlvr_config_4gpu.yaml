@@ -1,0 +1,201 @@
+defaults:
+  - ../config/deepspeed_zero2@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "qwen3-4B-proof-gen-rl"
+seed: 42
+logging_dir: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_logs
+output_dir: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_output
+
+checkpoint_config:
+  type: file_system
+  output_dir: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_ckpt
+
+track_with: wandb
+tracker_kwargs:
+  entity: tanzl-ustc
+  project: psro-math
+  mode: offline
+
+num_gpus_per_node: 4
+
+max_steps: 1000
+save_steps: 100
+logging_steps: 1
+resume_from_checkpoint: false
+
+# Batch settings
+rollout_batch_size: 16  # prompts per step
+prompt_length: 2048
+response_length: 4096
+
+# Async RL mode
+async_generation_ratio: 2
+generate_opt_level: 1
+is_num_return_sequences_expand: true
+
+# GRPO settings (no critic/reference needed)
+num_return_sequences_in_group: 8
+ppo_epochs: 1
+adv_estimator: "grpo"
+use_kl_loss: false
+init_kl_coef: 0.0
+
+# Clip settings
+reward_clip: 10
+advantage_clip: 2.0
+
+# Normalize
+norm_mean_type: batch
+norm_std_type: batch
+
+# Data mask
+max_len_mask: true
+difficulty_mask: false
+
+# Advantage
+whiten_advantages: true
+
+# Model paths
+pretrain: /mnt/shared-storage-user/tanzelin-p/proof_gen_ckpt/sft_train-0/checkpoint-30/sft_train
+reward_pretrain: /mnt/shared-storage-user/tanzelin-p/verifier_ckpt/sft_train-0/checkpoint-300/sft_train
+
+# Actor Training (GPU 0-1)
+actor_train:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0.01
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 8
+    warmup_steps: 20
+    num_train_epochs: 1
+  data_args:
+    template: native
+    file_name:
+      - /mnt/shared-storage-user/tanzelin-p/sft_data/proof_gen_rl_100k.jsonl
+    domain_interleave_probs:
+      proof_gen: 1.0
+    dataset_dir: /mnt/shared-storage-user/tanzelin-p/sft_data
+    messages: messages
+    interleave_probs: "1.0"
+    preprocessing_num_workers: 8
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero2}
+  device_mapping: "list(range(0,2))"
+  infer_batch_size: 2
+
+# Actor Inference (GPU 2 only)
+actor_infer:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: ${response_length}
+    top_p: 0.75
+    top_k: 50
+    num_beams: 1
+    temperature: 0.6
+    num_return_sequences: ${num_return_sequences_in_group}
+    repetition_penalty: 1.1
+  data_args:
+    template: native
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.85
+      enforce_eager: false
+      block_size: 16
+      max_model_len: 6144
+  device_mapping: "[2]"
+  infer_batch_size: 1
+
+# Rewards (GPU 3 only)
+# Current mode: inference (each reward worker holds GPU and does local inference)
+rewards:
+  proof_gen:
+    worker_cls: roll.pipeline.rlvr.rewards.proof_verifier_reward_worker.ProofVerifierRewardWorker
+    judge_model_type: inference
+    tag_included: [proof_gen]
+    model_args:
+      model_name_or_path: ${reward_pretrain}
+      attn_implementation: fa2
+      disable_gradient_checkpointing: true
+      dtype: bf16
+    generating_args:
+      max_new_tokens: 2048
+      top_p: 0.8
+      top_k: 50
+      num_beams: 1
+      temperature: 0.3
+      num_return_sequences: 1
+    data_args:
+      template: native
+    strategy_args:
+      strategy_name: vllm
+      strategy_config:
+        gpu_memory_utilization: 0.85
+        enforce_eager: false
+        block_size: 16
+        max_model_len: 8192
+        load_format: auto  # IMPORTANT: actually load weights for reward model
+    device_mapping: "[3]"
+    infer_batch_size: 4
+
+# ============================================================================
+# CLUSTER MODE CONFIGURATION (for continuous batching)
+# Uncomment to use cluster mode where reward_infer handles all inference
+# and reward workers only do judge logic without GPU.
+# This provides better GPU utilization through vLLM continuous batching.
+# ============================================================================
+
+# # Reward Inference Service (GPU 3, vLLM server mode)
+# reward_infer:
+#   model_args:
+#     model_name_or_path: ${reward_pretrain}
+#     attn_implementation: fa2
+#     disable_gradient_checkpointing: true
+#     dtype: bf16
+#   generating_args:
+#     max_new_tokens: 2048
+#     top_p: 0.8
+#     top_k: 50
+#     num_beams: 1
+#     temperature: 0.3
+#     num_return_sequences: 1
+#   data_args:
+#     template: native
+#   strategy_args:
+#     strategy_name: vllm
+#     strategy_config:
+#       gpu_memory_utilization: 0.85
+#       enforce_eager: false
+#       block_size: 16
+#       max_model_len: 8192
+#       load_format: auto
+#       engine_mode: async  # Enable continuous batching
+#   device_mapping: "[3]"
+#   infer_batch_size: 4
+
+# # Rewards (cluster mode - no GPU, only judge logic)
+# rewards:
+#   proof_gen:
+#     worker_cls: roll.pipeline.rlvr.rewards.proof_verifier_reward_worker.ProofVerifierRewardWorker
+#     judge_model_type: cluster  # Use reward_infer cluster
+#     tag_included: [proof_gen]
+#     world_size: 16  # Can scale up since no GPU needed
+#     # No device_mapping, model_args, strategy_args needed in cluster mode
+#     model_args:
+#       model_name_or_path: ${reward_pretrain}  # For tokenizer only
+#     data_args:
+#       template: native

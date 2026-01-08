@@ -1,0 +1,63 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "qwen3-4B-verifier-sft"
+seed: 42
+logging_dir: /mnt/shared-storage-user/tanzelin-p/verifier_logs
+output_dir: /mnt/shared-storage-user/tanzelin-p/verifier_ckpt
+
+# Wandb tracking
+track_with: wandb
+tracker_kwargs:
+  entity: tanzl-ustc
+  project: psro-math
+  mode: offline
+
+num_gpus_per_node: 4
+
+save_steps: 50
+max_ckpt_to_keep: 2
+logging_steps: 1
+resume_from_checkpoint: false
+
+sequence_length: 8192
+
+pretrain: /mnt/shared-storage-user/ma4agi-gpu/data/model/Qwen3-4B-Instruct-2507
+
+# SFT keys
+prompt_key: instruction
+query_key: input
+response_key: output
+
+sft_train:
+  model_args:
+    dtype: bf16
+  training_args:
+    num_train_epochs: 1
+    per_device_train_batch_size: 8
+    gradient_accumulation_steps: 4
+    learning_rate: 1.0e-5
+    warmup_ratio: 0.1
+    weight_decay: 0.01
+  data_args:
+    file_name: /mnt/shared-storage-user/tanzelin-p/sft_data/verifier_sft_train_filtered.json
+    template: native
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config:
+      train_micro_batch_size_per_gpu: auto
+      bf16:
+        enabled: true
+      zero_optimization:
+        stage: 2
+        allgather_partitions: true
+        allgather_bucket_size: 1.0e+9
+        overlap_comm: true
+        reduce_scatter: true
+        reduce_bucket_size: 5.0e+8
+        contiguous_gradients: true
+      gradient_clipping: 1.0
+  device_mapping: list(range(0,4))
+  infer_batch_size: 1
