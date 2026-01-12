@@ -59,6 +59,31 @@ class RewardConfig(WorkerConfig):
         default=None,
         metadata={"help": "judge_api_key."}
     )
+    vllm_server_url: str = field(
+        default=None,
+        metadata={"help": "vLLM HTTP server URL for continuous batching (e.g., 'http://localhost:8000'). "
+                  "Use with judge_model_type='vllm_server'. If not set, will be auto-generated."}
+    )
+    vllm_server_gpu: int = field(
+        default=None,
+        metadata={"help": "GPU index to run vLLM server on. Required when judge_model_type='vllm_server'."}
+    )
+    vllm_server_port: int = field(
+        default=8000,
+        metadata={"help": "Port for vLLM HTTP server. Default: 8000."}
+    )
+    vllm_server_model_path: str = field(
+        default=None,
+        metadata={"help": "Model path for vLLM server. If not set, uses model_args.model_name_or_path."}
+    )
+    vllm_server_gpu_memory_utilization: float = field(
+        default=0.85,
+        metadata={"help": "GPU memory utilization for vLLM server. Default: 0.85."}
+    )
+    vllm_server_max_model_len: int = field(
+        default=8192,
+        metadata={"help": "Max model length for vLLM server. Default: 8192."}
+    )
     format_pattern: str = field(
         default=None,
         metadata={"help": "The pattern of the answer format."}

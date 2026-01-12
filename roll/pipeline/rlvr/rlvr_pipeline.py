@@ -40,6 +40,7 @@ from roll.utils.kl_controller import get_kl_controller
 from roll.utils.logging import get_logger
 from roll.utils.metrics.metrics_manager import MetricsManager
 from roll.utils.dynamic_batching import dynamic_batching_shard
+from roll.utils.vllm_server import VLLMServerManager, stop_global_vllm_server
 
 
 logger = get_logger()
@@ -130,6 +131,9 @@ class RLVRPipeline(BasePipeline):
         super().__init__(pipeline_config)
         self.pipeline_config = pipeline_config
         self.is_lora = is_lora_training(self.pipeline_config)
+
+        # vLLM server manager for reward model (if using vllm_server mode)
+        self.vllm_server_manager: Optional[VLLMServerManager] = None
         scheduler_cls = (
             AsyncDynamicSamplingScheduler if self.pipeline_config.async_pipeline else DynamicSamplingScheduler
         )
@@ -315,6 +319,9 @@ class RLVRPipeline(BasePipeline):
         if not self.is_lora and self.pipeline_config.enable_reference:
             refs.extend(self.reference.initialize(pipeline_config=self.pipeline_config, blocking=True))
 
+        # Start vLLM HTTP server if any reward worker uses vllm_server mode
+        self._maybe_start_vllm_server()
+
         refs = []
         for key, cluster in self.rewards.items():
             refs.extend(cluster.initialize(pipeline_config=self.pipeline_config, blocking=False))
@@ -340,6 +347,71 @@ class RLVRPipeline(BasePipeline):
         self.running = {}
         for domain in self.rewards.keys():
             self.running[domain] = RunningMoments()
+
+    def _maybe_start_vllm_server(self):
+        """
+        Start vLLM HTTP server if any reward worker uses vllm_server mode.
+
+        This method:
+        1. Checks if any reward worker has judge_model_type='vllm_server'
+        2. If so, starts a vLLM server with the configured parameters
+        3. Updates the reward worker config with the server URL
+        """
+        # Find reward workers that need vLLM server
+        vllm_server_configs = []
+        for key, reward_config in self.pipeline_config.rewards.items():
+            if getattr(reward_config, 'judge_model_type', None) == 'vllm_server':
+                vllm_server_configs.append((key, reward_config))
+
+        if not vllm_server_configs:
+            logger.info("No reward workers using vllm_server mode")
+            return
+
+        # Use the first config to start the server (all should use the same server)
+        key, config = vllm_server_configs[0]
+
+        # Get model path
+        model_path = getattr(config, 'vllm_server_model_path', None)
+        if model_path is None:
+            model_path = config.model_args.model_name_or_path
+        if model_path is None:
+            raise ValueError(f"No model path specified for vLLM server in reward worker '{key}'. "
+                           "Set either vllm_server_model_path or model_args.model_name_or_path.")
+
+        # Get GPU ID
+        gpu_id = getattr(config, 'vllm_server_gpu', None)
+        if gpu_id is None:
+            raise ValueError(f"vllm_server_gpu must be specified for reward worker '{key}' "
+                           "when using judge_model_type='vllm_server'")
+
+        # Get other parameters
+        port = getattr(config, 'vllm_server_port', 8000)
+        gpu_mem = getattr(config, 'vllm_server_gpu_memory_utilization', 0.85)
+        max_model_len = getattr(config, 'vllm_server_max_model_len', 8192)
+
+        logger.info(f"Starting vLLM server for reward model on GPU {gpu_id}, port {port}")
+        logger.info(f"Model: {model_path}")
+
+        # Start server
+        self.vllm_server_manager = VLLMServerManager(
+            model_path=model_path,
+            gpu_id=gpu_id,
+            port=port,
+            gpu_memory_utilization=gpu_mem,
+            max_model_len=max_model_len,
+        )
+        server_url = self.vllm_server_manager.start()
+
+        # Update all vllm_server reward configs with the URL
+        for key, reward_config in vllm_server_configs:
+            reward_config.vllm_server_url = server_url
+            logger.info(f"Set vllm_server_url={server_url} for reward worker '{key}'")
+
+    def _stop_vllm_server(self):
+        """Stop the vLLM server if running."""
+        if self.vllm_server_manager is not None:
+            self.vllm_server_manager.stop()
+            self.vllm_server_manager = None
 
     @torch.no_grad()
     def save_metrics(self, batch):
