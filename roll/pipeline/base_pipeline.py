@@ -1,4 +1,6 @@
 import os
+import re
+import shutil
 from collections import defaultdict
 from concurrent import futures
 from typing import List, Any, Dict
@@ -91,8 +93,58 @@ class BasePipeline:
             self.state.save_rng_state(save_dir=save_dir, tag="pipeline")
             self.checkpoint_manager.upload(ckpt_id=ckpt_id, local_state_path=pipeline_save_dir)
 
+            # Clean up old checkpoints if max_ckpt_to_keep is set
+            self._cleanup_old_checkpoints()
+
         futures.wait(self.resume_futures)
         self.resume_futures.clear()
+
+    def _cleanup_old_checkpoints(self):
+        """Remove old checkpoints if max_ckpt_to_keep is set."""
+        max_ckpt = getattr(self.pipeline_config, 'max_ckpt_to_keep', 0)
+        if max_ckpt <= 0:
+            return
+
+        output_dir = self.pipeline_config.output_dir
+        if not os.path.exists(output_dir):
+            return
+
+        # Pattern to match checkpoint directories: checkpoint-{step}
+        ckpt_pattern = re.compile(r'^checkpoint-(\d+)$')
+
+        # Collect all checkpoint steps across all subdirectories
+        all_ckpt_steps = set()
+        for subdir in os.listdir(output_dir):
+            subdir_path = os.path.join(output_dir, subdir)
+            if not os.path.isdir(subdir_path):
+                continue
+            for item in os.listdir(subdir_path):
+                match = ckpt_pattern.match(item)
+                if match:
+                    all_ckpt_steps.add(int(match.group(1)))
+
+        # Sort steps and determine which to delete
+        sorted_steps = sorted(all_ckpt_steps, reverse=True)
+        steps_to_delete = sorted_steps[max_ckpt:]
+
+        if not steps_to_delete:
+            return
+
+        logger.info(f"Cleaning up old checkpoints. Keeping {max_ckpt}, deleting steps: {steps_to_delete}")
+
+        # Delete old checkpoints from all subdirectories
+        for subdir in os.listdir(output_dir):
+            subdir_path = os.path.join(output_dir, subdir)
+            if not os.path.isdir(subdir_path):
+                continue
+            for step in steps_to_delete:
+                ckpt_dir = os.path.join(subdir_path, f"checkpoint-{step}")
+                if os.path.exists(ckpt_dir):
+                    try:
+                        shutil.rmtree(ckpt_dir)
+                        logger.info(f"Deleted old checkpoint: {ckpt_dir}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete checkpoint {ckpt_dir}: {e}")
 
     def download_models(self, *clusters: Cluster):
         node2worker: Dict[str, Any] = {}

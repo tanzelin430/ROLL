@@ -59,11 +59,12 @@ class WandbTracker(BaseTracker):
         notes = kwargs.pop("notes", None)
         log_dir = kwargs.pop("log_dir", None)
         api_key = kwargs.pop("api_key", None)
+        mode = kwargs.pop("mode", None)
         settings = kwargs.pop("settings", {"console": "off"})
         import wandb
         if api_key:
             wandb.login(key=api_key)
-        self.run = wandb.init(project=project, tags=tags, name=name, notes=notes, dir=log_dir, settings=settings)
+        self.run = wandb.init(project=project, tags=tags, name=name, notes=notes, dir=log_dir, mode=mode, settings=settings)
 
         self.run.config.update(config, allow_val_change=True)
 
