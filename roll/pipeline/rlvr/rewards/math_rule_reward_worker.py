@@ -24,6 +24,7 @@ from roll.distributed.strategy.factory import create_strategy
 from roll.distributed.strategy.strategy import InferenceStrategy, TrainStrategy
 from roll.models.model_providers import default_reward_model_provider, default_tokenizer_provider
 from roll.utils.context_managers import state_offload_manger
+from roll.pipeline.rlvr.rewards.utils import extract_last_boxed
 
 class timeout:
     def __init__(self, seconds=1, error_message="Timeout"):
@@ -39,92 +40,25 @@ class timeout:
 
     def __exit__(self, type, value, traceback):
         signal.alarm(0)
-        
-def _extract_after_last_end_think(response: str, prompt: str, start_think: str='<think>', end_think: str='</think>') -> str:
-    """
-    提取字符串中最后一个 "</think>" 标签之后的所有文本。
 
-    校验逻辑会根据 prompt 的结尾而变化：
-    - (1) 如果 prompt 的结尾（去掉换行符后）是以 "<think>" 结尾：
-        - response 中不允许包含开标签 "<think>"。
-        - response 中包含的闭标签 "</think>" 不能超过一个。
-        - 若不满足，则返回空字符串。
-    - (2) 否则（prompt 不以 "<think>" 结尾）：
-        - response 中包含的闭标签 "</think>" 不能超过一个。
-        - 如果 response 中包含开标签 "<think>"，它必须出现在字符串的开头。
-        - 若不满足，则返回空字符串。
-
-    如果校验通过，则执行提取逻辑：
-    1. 优先按最后一个 '</think>' 分割。
-    2. 如果找不到，则回退到按最后一个双换行符 '\n\n' 分割。
-    3. 如果都找不到，则返回空字符串。
-
-    Args:
-        response (str): 输入的完整文本。
-        prompt (str): 用于生成 response 的提示文本。
-
-    Returns:
-        str: 提取出的文本块（已去除首尾空格），或空字符串。
-    """
-    # 检查 prompt 是否以 <think> 结尾
-    is_prompt_ending_with_think = prompt.rstrip('\n').endswith(start_think)
-
-    if is_prompt_ending_with_think:
-        if start_think in response or response.count(end_think) > 1:
-            return ""
-    else:        
-        if response.count(end_think) > 1 or start_think in response and not response.startswith(start_think):
-            return ""
-
-    # 1. 优先尝试按 '</think>' 分割
-    _before_think, sep_think, after_think = response.rpartition(end_think)
-
-    if sep_think:
-        # 如果找到了 '</think>'，则返回它后面的部分，并清理首尾空格
-        return after_think.strip()
-    else:
-        # 2. 如果没找到 '</think>'，则尝试按最后一个 '\n\n' 分割
-        _before_newline, sep_newline, after_newline = response.rpartition('\n\n')
-        if sep_newline:
-            # 如果找到了 '\n\n'，返回它后面的部分，并清理首尾空格
-            return after_newline.strip()
-        else:
-            # 3. 如果连 '\n\n' 都没找到，则返回空字符串
-            return ""
 
 def _hf_verify_math_sample(response, answer, result, prompt):
     try:
-        # 在解析之前，先对模型的原始输出进行预处理
-        cleaned_response = _extract_after_last_end_think(response, prompt)
-        """
-        --- `parse` 函数完整参数介绍与使用建议 ---
-        `parse` 函数用于从文本中提取并解析数学答案，其主要参数如下：
-        
-        1. `pred` (位置参数): 需要被解析的输入字符串。
-           => 建议：传入净化后的文本（如 cleaned_response），可以显著提高准确率。
-        
-        2. `extraction_config` (关键字参数): 定义要寻找的答案类型。
-           => 默认值: [LatexExtractionConfig(), ExprExtractionConfig()] (寻找LaTeX和纯数字)
-           => 建议：对于数学计算题，保持默认即可。
-        
-        3. `fallback_mode` (关键字参数): 定义当找到答案文本但无法成功解析时怎么办。
-           => 默认值: "first_match" (返回原始匹配的字符串)
-           => 强烈建议: 设为 "no_fallback"，这样在解析失败时会返回空列表[]，避免输出垃圾内容。
-        
-        4. `extraction_mode` (关键字参数): 定义搜寻答案的范围。
-           => 默认值: "any_match" (搜寻全文，找到第一个能成功解析的答案)
-           => 建议：保持默认值，因为它更可能在复杂文本中找到正确答案。
-        
-        5. `parsing_timeout` (关键字参数): 解析单个表达式的超时时间（秒）。
-           => 默认值: 5
-           => 建议：保留默认值，作为防止程序卡死的安全保护。
-        
-        6. `raise_on_error` (关键字参数): 遇到内部程序错误时是否抛出异常。
-           => 默认值: False (不抛出异常，返回空列表)
-           => 建议：保持默认值，确保程序的健壮性，不会因单个样本出错而中断。
-        """
+        # 使用健壮的 \boxed{} 提取，不依赖 \n\n 或 </think> 分隔符
+        # 这在 enable_thinking=False 时也能正常工作
+        boxed_content = extract_last_boxed(response)
+
+        # 如果找到 \boxed{}，直接解析其内容
+        # 否则尝试让 parse() 从完整响应中提取
+        if boxed_content is not None:
+            # 将提取的内容包装为 \boxed{} 格式，让 parse() 处理
+            cleaned_response = f"\\boxed{{{boxed_content}}}"
+        else:
+            # 没有找到 \boxed{}，尝试用完整响应
+            cleaned_response = response
+
         parsed_answers = parse(cleaned_response, fallback_mode="no_fallback")
-        
+
         # 如果解析结果为空，则认为提取失败
         if not parsed_answers:
             exect_answer = None
@@ -140,7 +74,7 @@ def _hf_verify_math_sample(response, answer, result, prompt):
             # 假设 verify 函数可以处理 parse 返回的对象
             ans = verify(gold_answer[0], exect_answer)
             result.append((ans, str(gold_answer[0]), str(exect_answer)))
-            
+
     except Exception as e:
         # 捕获任何潜在的异常，确保进程不会崩溃
         result.append((False, "", ""))
@@ -230,9 +164,25 @@ class MathRuleRewardWorker(Worker):
         long_block_penalty_rewards = []
         response_length_rewards = []
         format_rewards = []
-        
+
         response_text_list = self.tokenizer.batch_decode(data.batch["responses"], skip_special_tokens=False)
         prompt_text_list = self.tokenizer.batch_decode(data.batch["prompts"], skip_special_tokens=False)
+
+        # Check if ground_truth exists
+        if "ground_truth" not in data.non_tensor_batch:
+            self.logger.error("ground_truth not found in non_tensor_batch!")
+            # Return zeros
+            batch_size = len(response_text_list)
+            token_level_rewards = torch.zeros_like(data.batch["responses"], dtype=torch.float16)
+            scores = torch.zeros(batch_size, dtype=torch.float16)
+            return DataProto.from_dict(
+                tensors={
+                    "token_level_rewards": token_level_rewards,
+                    "response_level_rewards": scores,
+                    "scores": scores,
+                }
+            )
+
         for response, answer, prompt in zip(response_text_list, data.non_tensor_batch["ground_truth"], prompt_text_list):
             
             prompt = prompt.replace("<|endoftext|>", "").replace("<pad>", "")
@@ -245,15 +195,15 @@ class MathRuleRewardWorker(Worker):
                     correct, extracted_ground_truth, extracted_response = hf_verify_math_sample(
                         response, f"${answer}$", prompt
                     )
-            
+
                 log_data = {
-                    "response": response,
+                    "response": response[-200:],  # Last 200 chars
                     "extracted_response": extracted_response,
                     "answer": answer,
                     "extracted_ground_truth": extracted_ground_truth,
                     "correct": correct,
                 }
-                # self.logger.info(json.dumps(log_data, ensure_ascii=False))
+                self.logger.debug(json.dumps(log_data, ensure_ascii=False))
 
             except Exception as e:
                 self.logger.error(f"timeout or error during hf_verify_math_sample. answer: {answer}, response: {response}")

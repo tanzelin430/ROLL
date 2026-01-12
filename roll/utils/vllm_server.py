@@ -37,7 +37,7 @@ class VLLMServerManager:
     def __init__(
         self,
         model_path: str,
-        gpu_id: int,
+        gpu_id: str,
         port: int = 8000,
         gpu_memory_utilization: float = 0.85,
         max_model_len: int = 8192,
@@ -45,13 +45,15 @@ class VLLMServerManager:
         host: str = "0.0.0.0",
         startup_timeout: int = 300,
         log_file: Optional[str] = None,
+        tensor_parallel_size: int = 1,
     ):
         """
         Initialize the vLLM server manager.
 
         Args:
             model_path: Path to the model to serve
-            gpu_id: GPU index to run the server on
+            gpu_id: GPU index(es) to run the server on. Can be single int/str (e.g., "3")
+                    or comma-separated for tensor parallel (e.g., "6,7")
             port: Port to listen on
             gpu_memory_utilization: GPU memory utilization (0.0-1.0)
             max_model_len: Maximum model context length
@@ -59,9 +61,10 @@ class VLLMServerManager:
             host: Host to bind to
             startup_timeout: Timeout in seconds to wait for server startup
             log_file: Path to log file for server output (default: /tmp/vllm_server_{port}.log)
+            tensor_parallel_size: Number of GPUs for tensor parallelism (default: 1)
         """
         self.model_path = model_path
-        self.gpu_id = gpu_id
+        self.gpu_id = str(gpu_id)  # Ensure string for CUDA_VISIBLE_DEVICES
         self.port = port
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
@@ -69,6 +72,7 @@ class VLLMServerManager:
         self.host = host
         self.startup_timeout = startup_timeout
         self.log_file = log_file or f"/tmp/vllm_server_{port}.log"
+        self.tensor_parallel_size = tensor_parallel_size
 
         self.process: Optional[subprocess.Popen] = None
         self.url: Optional[str] = None
@@ -103,9 +107,13 @@ class VLLMServerManager:
             "--trust-remote-code",
         ]
 
-        # Set environment for specific GPU
+        # Add tensor parallel if > 1
+        if self.tensor_parallel_size > 1:
+            cmd.extend(["--tensor-parallel-size", str(self.tensor_parallel_size)])
+
+        # Set environment for specific GPU(s)
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        env["CUDA_VISIBLE_DEVICES"] = self.gpu_id
 
         logger.info(f"Starting vLLM server on GPU {self.gpu_id}, port {self.port}")
         logger.info(f"Command: CUDA_VISIBLE_DEVICES={self.gpu_id} {' '.join(cmd)}")
@@ -217,10 +225,11 @@ _global_server_manager: Optional[VLLMServerManager] = None
 
 def get_or_start_vllm_server(
     model_path: str,
-    gpu_id: int,
+    gpu_id: str,
     port: int = 8000,
     gpu_memory_utilization: float = 0.85,
     max_model_len: int = 8192,
+    tensor_parallel_size: int = 1,
 ) -> str:
     """
     Get or start a global vLLM server instance.
@@ -230,10 +239,11 @@ def get_or_start_vllm_server(
 
     Args:
         model_path: Path to the model to serve
-        gpu_id: GPU index to run the server on
+        gpu_id: GPU index(es) to run the server on (e.g., "3" or "6,7")
         port: Port to listen on
         gpu_memory_utilization: GPU memory utilization
         max_model_len: Maximum model context length
+        tensor_parallel_size: Number of GPUs for tensor parallelism
 
     Returns:
         str: The server URL
@@ -250,6 +260,7 @@ def get_or_start_vllm_server(
         port=port,
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
+        tensor_parallel_size=tensor_parallel_size,
     )
 
     return _global_server_manager.start()

@@ -81,10 +81,10 @@ actor_train:
   data_args:
     template: native
     file_name:
-      - /mnt/shared-storage-user/tanzelin-p/sft_data/proof_gen_rl_100k.jsonl
+      - /mnt/shared-storage-user/tanzelin-p/rl_data/proof_gen_rl_100k.jsonl
     domain_interleave_probs:
       proof_gen: 1.0
-    dataset_dir: /mnt/shared-storage-user/tanzelin-p/sft_data
+    dataset_dir: /mnt/shared-storage-user/tanzelin-p/rl_data
     messages: messages
     interleave_probs: "1.0"
     preprocessing_num_workers: 8

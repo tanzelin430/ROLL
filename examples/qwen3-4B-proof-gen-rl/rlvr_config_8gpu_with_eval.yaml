@@ -1,0 +1,203 @@
+defaults:
+  - ../config/deepspeed_zero2@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "qwen3-4B-proof-gen-rl-8gpu-with-eval"
+seed: 42
+logging_dir: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_logs
+output_dir: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_output
+
+checkpoint_config:
+  type: file_system
+  output_dir: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_ckpt
+
+track_with: wandb
+tracker_kwargs:
+  entity: tanzl-ustc
+  project: psro-math
+  mode: online
+
+num_gpus_per_node: 8
+
+max_steps: 1600
+save_steps: 100
+max_ckpt_to_keep: 2
+logging_steps: 1
+eval_steps: 5
+resume_from_checkpoint: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_ckpt/20260110-210343/checkpoint-100
+
+# Batch settings - doubled for 8 GPU
+rollout_batch_size: 64
+prompt_length: 2048
+response_length: 4096
+
+# Async RL mode
+async_generation_ratio: 2
+generate_opt_level: 1
+is_num_return_sequences_expand: true
+
+# GRPO settings
+num_return_sequences_in_group: 8
+ppo_epochs: 1
+adv_estimator: "grpo"
+use_kl_loss: false
+init_kl_coef: 0.0
+
+# Clip settings
+reward_clip: 10
+advantage_clip: 2.0
+
+# Normalize
+norm_mean_type: batch
+norm_std_type: batch
+
+# Data mask
+max_len_mask: true
+difficulty_mask: false
+
+# Advantage
+whiten_advantages: true
+
+# Model paths
+pretrain: /mnt/shared-storage-user/tanzelin-p/proof_gen_ckpt/sft_train-0/checkpoint-36/sft_train
+reward_pretrain: /mnt/shared-storage-user/tanzelin-p/verifier_ckpt/sft_train-0/checkpoint-300/sft_train
+
+# Tag to domain mapping
+tag_2_domain:
+  proof_gen: proof_gen
+  aime2024: math_rule
+  amc2023: math_rule
+  math500: math_rule
+  minerva: math_rule
+  gpqa_diamond: multiple_choice
+
+# ============================================================================
+# VALIDATION
+# ============================================================================
+validation:
+  data_args:
+    template: native
+    file_name:
+      - /mnt/shared-storage-user/ma4agi-gpu/data/eval_benchmarks/eval_benchmarks_small.jsonl
+    messages: messages
+  generating_args:
+    max_new_tokens: ${response_length}
+    repetition_penalty: 1.2
+    top_p: 0.75
+    top_k: 50
+    num_beams: 1
+    temperature: 0.6
+    num_return_sequences: 1
+
+# ============================================================================
+# Actor Training (GPU 0-3, 4x training capacity)
+# ============================================================================
+actor_train:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0.01
+    per_device_train_batch_size: 8
+    gradient_accumulation_steps: 4
+    warmup_steps: 10
+    num_train_epochs: 1
+  data_args:
+    template: native
+    file_name:
+      - /mnt/shared-storage-user/tanzelin-p/rl_data/proof_gen_rl_100k.jsonl
+    domain_interleave_probs:
+      proof_gen: 1.0
+    dataset_dir: /mnt/shared-storage-user/tanzelin-p/rl_data
+    messages: messages
+    interleave_probs: "1.0"
+    preprocessing_num_workers: 16
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero2}
+  device_mapping: "list(range(0,4))"
+  infer_batch_size: 4
+
+# ============================================================================
+# Actor Inference (GPU 4-5, TP=2)
+# ============================================================================
+actor_infer:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: ${response_length}
+    top_p: 0.75
+    top_k: 50
+    num_beams: 1
+    temperature: 0.6
+    num_return_sequences: ${num_return_sequences_in_group}
+    repetition_penalty: 1.3
+  data_args:
+    template: native
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.85
+      enforce_eager: false
+      block_size: 16
+      max_model_len: 6144
+      tensor_parallel_size: 2
+  device_mapping: "[4,5]"
+  infer_batch_size: 2
+
+# ============================================================================
+# REWARD WORKERS (doubled CPU = doubled workers)
+# ============================================================================
+rewards:
+  # Training reward: Verifier model via vLLM server (GPU 6-7, TP=2)
+  proof_gen:
+    worker_cls: roll.pipeline.rlvr.rewards.proof_verifier_reward_worker.ProofVerifierRewardWorker
+    judge_model_type: vllm_server
+    vllm_server_gpu: "6,7"
+    vllm_server_port: 8000
+    vllm_server_gpu_memory_utilization: 0.85
+    vllm_server_max_model_len: 10240
+    vllm_server_tensor_parallel_size: 2
+    tag_included: [proof_gen]
+    world_size: 128  # Doubled from 64 (more CPU cores)
+    model_args:
+      model_name_or_path: ${reward_pretrain}
+    generating_args:
+      max_new_tokens: 3072
+      top_p: 0.8
+      top_k: 50
+      num_beams: 1
+      temperature: 0.3
+      num_return_sequences: 1
+      repetition_penalty: 1.2
+    data_args:
+      template: native
+
+  # Validation reward: Rule-based math answer verification
+  math_rule:
+    worker_cls: roll.pipeline.rlvr.rewards.math_rule_reward_worker.MathRuleRewardWorker
+    tag_included: [aime2024, amc2023, math500, minerva]
+    world_size: 16  # Doubled from 8
+    model_args:
+      model_name_or_path: ${pretrain}
+    data_args:
+      template: native
+
+  # Validation reward: Multiple choice answer verification
+  multiple_choice:
+    worker_cls: roll.pipeline.rlvr.rewards.multiple_choice_boxed_rule_reward_worker.MultipleChoiceBoxedRuleRewardWorker
+    tag_included: [gpqa_diamond]
+    world_size: 16  # Doubled from 8
+    model_args:
+      model_name_or_path: ${pretrain}
+    data_args:
+      template: native

@@ -22,6 +22,39 @@ from roll.distributed.scheduler.protocol import DataProto
 from roll.distributed.strategy.factory import create_strategy
 from roll.distributed.strategy.strategy import InferenceStrategy, TrainStrategy
 from roll.models.model_providers import default_tokenizer_provider, default_reward_model_provider
+from roll.pipeline.rlvr.rewards.utils import extract_last_boxed
+
+
+def extract_solution_after_think(response: str) -> str:
+    """
+    Extract the solution part after </think> tag.
+
+    For reasoning models with enable_thinking=True, the output format is:
+    <think>
+    [reasoning process - may contain errors, exploration]
+    </think>
+    [final solution - this is what should be verified]
+
+    Args:
+        response: Full model response, may or may not contain <think> blocks
+
+    Returns:
+        The solution part (after </think> if present, otherwise full response)
+    """
+    # Find the last </think> tag (in case of multiple think blocks)
+    think_end_tag = "</think>"
+    last_think_end = response.rfind(think_end_tag)
+
+    if last_think_end != -1:
+        # Extract everything after </think>
+        solution = response[last_think_end + len(think_end_tag):].strip()
+        # If solution is empty (model didn't output anything after think), use full response
+        if not solution:
+            return response
+        return solution
+
+    # No </think> tag found, return full response
+    return response
 
 
 # Verifier prompt template (same as SFT training data)
@@ -94,12 +127,12 @@ class ProofVerifierRewardWorker(Worker):
 
         if self.judge_model_type == "api":
             self.tokenizer = default_tokenizer_provider(model_args=self.worker_config.model_args)
-            self.logger.info(f"{self.worker_name} initialized with API model")
+            self.logger.debug(f"{self.worker_name} initialized with API model")
         elif self.judge_model_type == "inference":
             self.strategy = create_strategy(worker=self)
             self.strategy.initialize(model_provider=default_reward_model_provider)
             self.tokenizer = self.strategy.tokenizer
-            self.logger.info(f"{self.worker_name} initialized with local inference model")
+            self.logger.debug(f"{self.worker_name} initialized with local inference model")
         elif self.judge_model_type == "cluster":
             # Cluster mode: use external reward_infer cluster
             # Tokenizer from reward_infer config (should match verifier model)
@@ -108,7 +141,7 @@ class ProofVerifierRewardWorker(Worker):
             else:
                 # Fallback to worker config
                 self.tokenizer = default_tokenizer_provider(model_args=self.worker_config.model_args)
-            self.logger.info(f"{self.worker_name} initialized with cluster mode (no local GPU)")
+            self.logger.debug(f"{self.worker_name} initialized with cluster mode (no local GPU)")
         elif self.judge_model_type == "vllm_server":
             # vLLM HTTP server mode: true continuous batching via HTTP API
             # Get URL and model name from pipeline_config (set by pipeline after starting server)
@@ -130,7 +163,7 @@ class ProofVerifierRewardWorker(Worker):
                                "Ensure vllm_server_gpu is configured so pipeline can auto-start the server.")
             # Only need tokenizer for chat template formatting
             self.tokenizer = default_tokenizer_provider(model_args=self.worker_config.model_args)
-            self.logger.info(f"{self.worker_name} initialized with vLLM server mode: {self.vllm_server_url}, model: {self.vllm_model_name}")
+            self.logger.debug(f"{self.worker_name} initialized with vLLM server mode: {self.vllm_server_url}, model: {self.vllm_model_name}")
         else:
             raise ValueError(f"Unsupported judge_model_type: {self.judge_model_type}")
 
@@ -146,63 +179,65 @@ class ProofVerifierRewardWorker(Worker):
         self.logger.info(f"{self.worker_name} connected to reward_infer cluster")
         self.logger.info(f"infer_cluster type={type(infer_cluster)}, workers={getattr(infer_cluster, 'workers', 'NO_WORKERS')}")
 
+    # Internal marker for extraction failure (will be replaced with 0.0)
+    _EXTRACTION_FAILED = -999.0
+
     def _extract_score(self, llm_response: str) -> float:
         """
         Extract score from verifier's llm_response containing \\boxed{score}.
 
-        Tested verifier output format:
-        ```
-        Based on my evaluation, the final score is:
-        \\[
-        \\boxed{1}
-        \\]
-        ```
+        Uses the shared extract_last_boxed() function for robust extraction.
+        This handles both display math \\[\\boxed{1}\\] and inline \\boxed{1}.
+
+        For verifier with thinking enabled, the score is after </think> tag.
 
         Args:
             llm_response: The response from the verifier model (NOT the actor's proof)
 
         Returns:
-            float: Score value (0.0, 0.5, or 1.0). Defaults to 0.5 if extraction fails.
+            float: Score value (0.0, 0.5, or 1.0). Returns _EXTRACTION_FAILED (-999.0) if extraction fails.
         """
         # IMPORTANT: Only extract from llm_response (verifier output), not from actor's proof
         if not llm_response or not llm_response.strip():
-            self.logger.warning("Empty llm_response from verifier, defaulting score to 0.5")
-            return 0.5
+            return self._EXTRACTION_FAILED
+
+        # For verifier with thinking, extract score from after </think>
+        # The \boxed{score} should be in the solution part, not in thinking
+        score_text = extract_solution_after_think(llm_response)
+
+        # Valid scores
+        VALID_SCORES = [0.0, 0.5, 1.0]
 
         try:
-            # Pattern 1: \[\s*\boxed{X}\s*\] (display math, most common)
-            match = re.search(r'\\\[\s*\\boxed\s*\{\s*([0-9.]+)\s*\}\s*\\\]', llm_response)
-            if match:
-                score = float(match.group(1))
-                if score in [0.0, 0.5, 1.0]:
-                    return score
-                self.logger.warning(f"Unexpected score value in display math: {score}")
-                return min(max(score, 0.0), 1.0)  # Clamp to [0, 1]
+            # Use shared extraction function (handles nested braces correctly)
+            content = extract_last_boxed(score_text)
 
-            # Pattern 2: \boxed{X} (inline, without display math)
-            match = re.search(r'\\boxed\s*\{\s*([0-9.]+)\s*\}', llm_response)
-            if match:
-                score = float(match.group(1))
-                if score in [0.0, 0.5, 1.0]:
-                    return score
-                self.logger.warning(f"Unexpected score value in inline boxed: {score}")
-                return min(max(score, 0.0), 1.0)
+            if content is None:
+                # Fallback: try to find "score: X" pattern in score_text (after </think>)
+                matches = re.findall(r'(?:final\s+)?score[:\s]+(-?[0-9.]+)', score_text, re.IGNORECASE)
+                if matches:
+                    score = float(matches[-1])
+                    if score in VALID_SCORES:
+                        return score
+                    return min(max(score, 0.0), 1.0)
+                return self._EXTRACTION_FAILED
 
-            # Pattern 3: "final score is: X" or "score: X" (fallback)
-            match = re.search(r'(?:final\s+)?score[:\s]+([0-9.]+)', llm_response, re.IGNORECASE)
-            if match:
-                score = float(match.group(1))
-                if score <= 1.0:
-                    return score
-                # Normalize 0-10 scale to 0-1
-                return min(score / 10.0, 1.0)
+            # Parse the extracted content as a number
+            score = float(content.strip())
+            if score in VALID_SCORES:
+                return score
 
-            self.logger.warning(f"Could not extract score from llm_response: {llm_response[-300:]}")
-            return 0.5  # Default to middle value
+            # Clamp unexpected values to [0, 1]
+            self.logger.warning(f"Unexpected score value: {score}, clamping to [0, 1]")
+            return min(max(score, 0.0), 1.0)
 
+        except ValueError:
+            # content was not a valid number
+            self.logger.warning(f"Could not parse score from boxed content: '{content}'")
+            return self._EXTRACTION_FAILED
         except Exception as e:
             self.logger.error(f"Error extracting score: {e}")
-            return 0.5
+            return self._EXTRACTION_FAILED
 
     def _format_judge_prompt(self, prompt: str, response: str, reference: str = None) -> List[Dict]:
         """
@@ -357,7 +392,7 @@ class ProofVerifierRewardWorker(Worker):
         )
         data.meta_info = {"generation_config": generation_config}
 
-        self.logger.info(f"Calling reward_infer.generate with batch_size={len(texts)}")
+        self.logger.debug(f"Calling reward_infer.generate with batch_size={len(texts)}")
 
         # Call generate - vLLM handles batching internally
         result = ray.get(self.infer_cluster.generate.remote(data=data))
@@ -371,7 +406,7 @@ class ProofVerifierRewardWorker(Worker):
             generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
             results.append(generated_text.strip())
 
-        self.logger.info(f"Received {len(results)} responses from reward_infer")
+        self.logger.debug(f"Received {len(results)} responses from reward_infer")
         return results
 
     def _vllm_server_inference(self, all_messages: List[List[Dict]]) -> List[str]:
@@ -419,10 +454,8 @@ class ProofVerifierRewardWorker(Worker):
             if self.tokenizer.eos_token:
                 payload["stop"] = [self.tokenizer.eos_token]
 
-            self.logger.info(f"[VLLM] Sending request {idx+1}/{len(all_messages)}, prompt_len={len(prompt)}")
             try:
                 resp = requests.post(url, json=payload, timeout=120)
-                self.logger.info(f"[VLLM] Got response {idx+1}/{len(all_messages)}, status={resp.status_code}")
                 if resp.status_code != 200:
                     self.logger.error(f"vLLM server error: {resp.status_code} - {resp.text[:500]}")
                     results.append("")
@@ -450,18 +483,20 @@ class ProofVerifierRewardWorker(Worker):
         import torch
         import json
 
-        # DEBUG: Log judge_model_type and vllm_server_url
-        self.logger.info(f"[DEBUG] compute_rewards: judge_model_type={self.judge_model_type}, vllm_server_url={self.vllm_server_url}")
-
         # Decode prompts and responses directly from batch
         prompts_text_list = self.actor_tokenizer.batch_decode(data.batch["prompts"], skip_special_tokens=True)
         response_text_list = self.actor_tokenizer.batch_decode(data.batch["responses"], skip_special_tokens=True)
         prompt_ids = data.non_tensor_batch["id"]
 
         # Prepare all judge prompts for batch inference
+        # Extract solution part (after </think>) for verification
         all_messages = []
+        solution_text_list = []
         for prompt_txt, response in zip(prompts_text_list, response_text_list):
-            messages = self._format_judge_prompt(prompt_txt, response)
+            # For reasoning models with thinking, only verify the solution part
+            solution = extract_solution_after_think(response)
+            solution_text_list.append(solution)
+            messages = self._format_judge_prompt(prompt_txt, solution)
             all_messages.append(messages)
 
         # Run batch inference based on mode
@@ -474,22 +509,40 @@ class ProofVerifierRewardWorker(Worker):
         else:
             raise NotImplementedError(f"Mode {self.judge_model_type} not implemented for ProofVerifierRewardWorker")
 
-        # Extract scores from responses
+        # Extract scores from verifier responses
         scores = []
-        for i, (prompt_id, prompt_txt, response, llm_response) in enumerate(
-            zip(prompt_ids, prompts_text_list, response_text_list, llm_responses)
+        failed_extractions = []
+        for i, (prompt_id, prompt_txt, response, solution, llm_response) in enumerate(
+            zip(prompt_ids, prompts_text_list, response_text_list, solution_text_list, llm_responses)
         ):
             score = self._extract_score(llm_response)
+
+            # Track extraction failures
+            if score == self._EXTRACTION_FAILED:
+                failed_extractions.append({
+                    "prompt_id": prompt_id,
+                    "llm_response_tail": llm_response[-300:] if llm_response else "<empty>",
+                })
+                score = 0.0  # Replace with 0 for training
+
             scores.append(score)
 
             info = {
                 "prompt_id": prompt_id,
                 "score": score,
-                "prompt": prompt_txt[:500] + "..." if len(prompt_txt) > 50000 else prompt_txt,
-                "response": response[:500] + "..." if len(response) > 50000 else response,
-                "llm_response": llm_response[-500:] if len(llm_response) > 50000 else llm_response,
+                "prompt": prompt_txt,
+                "response": response,
+                "llm_response": llm_response,
             }
-            self.logger.info(f"{json.dumps(info, ensure_ascii=False)}")
+            self.logger.debug(f"{json.dumps(info, ensure_ascii=False)}")
+
+        # Log extraction failures
+        if failed_extractions:
+            self.logger.warning(
+                f"Score extraction failed for {len(failed_extractions)}/{len(scores)} samples (assigned 0.0):"
+            )
+            for fail in failed_extractions[:3]:  # Show first 3 failures
+                self.logger.warning(f"  - prompt_id={fail['prompt_id']}, response_tail: {fail['llm_response_tail'][:100]}...")
 
         # Create tensors in expected format
         scores_tensor = torch.tensor(scores, dtype=torch.float16)
@@ -498,7 +551,7 @@ class ProofVerifierRewardWorker(Worker):
 
         # Log summary
         mean_reward = scores_tensor.float().mean().item()
-        self.logger.info(f"Computed rewards for {len(scores)} samples, mean reward: {mean_reward:.4f}")
+        self.logger.debug(f"Computed rewards for {len(scores)} samples, mean reward: {mean_reward:.4f}")
 
         # Return in the correct format expected by the pipeline
         output = DataProto.from_dict(
@@ -512,7 +565,10 @@ class ProofVerifierRewardWorker(Worker):
         metrics = {
             "reward/mean": mean_reward,
             "reward/score_1_ratio": sum(1 for s in scores if s == 1.0) / len(scores),
+            "reward/score_0.5_ratio": sum(1 for s in scores if s == 0.5) / len(scores),
             "reward/score_0_ratio": sum(1 for s in scores if s == 0.0) / len(scores),
+            "reward/extraction_failed": len(failed_extractions),
+            "reward/extraction_failed_ratio": len(failed_extractions) / len(scores) if scores else 0,
         }
         output.meta_info = {"metrics": metrics}
 

@@ -1,0 +1,63 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "qwen3-8B-proof-gen-sft"
+seed: 42
+logging_dir: /mnt/shared-storage-user/tanzelin-p/qwen3_8B_proof_gen_logs
+output_dir: /mnt/shared-storage-user/tanzelin-p/qwen3_8B_proof_gen_ckpt
+
+# Wandb tracking
+track_with: wandb
+tracker_kwargs:
+  entity: tanzl-ustc
+  project: psro-math
+  mode: offline
+
+num_gpus_per_node: 8
+
+save_steps: 6
+max_ckpt_to_keep: 1
+logging_steps: 1
+resume_from_checkpoint: false
+
+sequence_length: 5000
+
+pretrain: /mnt/shared-storage-user/ma4agi-gpu/data/model/Qwen3-8B
+
+# SFT keys
+prompt_key: instruction
+query_key: input
+response_key: output
+
+sft_train:
+  model_args:
+    dtype: bf16
+  training_args:
+    num_train_epochs: 1
+    per_device_train_batch_size: 8  # Reduced from 16 for 8B model
+    gradient_accumulation_steps: 4
+    learning_rate: 1.0e-5
+    warmup_ratio: 0.1
+    weight_decay: 0.01
+  data_args:
+    file_name: /mnt/shared-storage-user/tanzelin-p/sft_data/proof_gen_sft_10k.json
+    template: qwen3_no_think  # Use qwen3 with enable_thinking=False
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config:
+      train_micro_batch_size_per_gpu: auto
+      bf16:
+        enabled: true
+      zero_optimization:
+        stage: 2
+        allgather_partitions: true
+        allgather_bucket_size: 1.0e+9
+        overlap_comm: true
+        reduce_scatter: true
+        reduce_bucket_size: 5.0e+8
+        contiguous_gradients: true
+      gradient_clipping: 1.0
+  device_mapping: list(range(0,8))
+  infer_batch_size: 1

@@ -64,9 +64,11 @@ class RewardConfig(WorkerConfig):
         metadata={"help": "vLLM HTTP server URL for continuous batching (e.g., 'http://localhost:8000'). "
                   "Use with judge_model_type='vllm_server'. If not set, will be auto-generated."}
     )
-    vllm_server_gpu: int = field(
+    vllm_server_gpu: str = field(
         default=None,
-        metadata={"help": "GPU index to run vLLM server on. Required when judge_model_type='vllm_server'."}
+        metadata={"help": "GPU index(es) to run vLLM server on. Can be single GPU (e.g., '3') "
+                  "or comma-separated for tensor parallel (e.g., '6,7'). "
+                  "Required when judge_model_type='vllm_server'."}
     )
     vllm_server_port: int = field(
         default=8000,
@@ -83,6 +85,11 @@ class RewardConfig(WorkerConfig):
     vllm_server_max_model_len: int = field(
         default=8192,
         metadata={"help": "Max model length for vLLM server. Default: 8192."}
+    )
+    vllm_server_tensor_parallel_size: int = field(
+        default=1,
+        metadata={"help": "Tensor parallel size for vLLM server. Default: 1. "
+                  "Set to 2+ for multi-GPU tensor parallelism."}
     )
     format_pattern: str = field(
         default=None,

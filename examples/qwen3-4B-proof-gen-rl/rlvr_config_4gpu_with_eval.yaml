@@ -6,7 +6,7 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "qwen3-4B-proof-gen-rl"
+exp_name: "qwen3-4B-proof-gen-rl-with-eval"
 seed: 42
 logging_dir: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_logs
 output_dir: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_output
@@ -25,11 +25,13 @@ num_gpus_per_node: 4
 
 max_steps: 1000
 save_steps: 100
+max_ckpt_to_keep: 2
 logging_steps: 1
+eval_steps: 1  # Evaluate on benchmarks every 50 steps (step 0 = baseline)
 resume_from_checkpoint: false
 
 # Batch settings
-rollout_batch_size: 16  # prompts per step
+rollout_batch_size: 32
 prompt_length: 2048
 response_length: 4096
 
@@ -61,8 +63,38 @@ difficulty_mask: false
 whiten_advantages: true
 
 # Model paths
-pretrain: /mnt/shared-storage-user/tanzelin-p/proof_gen_ckpt/sft_train-0/checkpoint-30/sft_train
+pretrain: /mnt/shared-storage-user/tanzelin-p/proof_gen_ckpt/sft_train-0/checkpoint-36/sft_train
 reward_pretrain: /mnt/shared-storage-user/tanzelin-p/verifier_ckpt/sft_train-0/checkpoint-300/sft_train
+
+# Tag to domain mapping (for validation benchmarks)
+tag_2_domain:
+  # Training domain
+  proof_gen: proof_gen
+  # Math benchmarks -> math_rule
+  aime2024: math_rule
+  amc2023: math_rule
+  math500: math_rule
+  minerva: math_rule
+  # Choice benchmarks -> multiple_choice
+  gpqa_diamond: multiple_choice
+
+# ============================================================================
+# VALIDATION: Evaluate on all benchmarks during training
+# ============================================================================
+validation:
+  data_args:
+    template: native
+    file_name:
+      - /mnt/shared-storage-user/ma4agi-gpu/data/eval_benchmarks/eval_benchmarks_small.jsonl
+    messages: messages
+  generating_args:
+    max_new_tokens: ${response_length}
+    repetition_penalty: 1.2
+    top_p: 0.75
+    top_k: 50
+    num_beams: 1
+    temperature: 0.6
+    num_return_sequences: 1
 
 # Actor Training (GPU 0-1)
 actor_train:
@@ -74,9 +106,9 @@ actor_train:
   training_args:
     learning_rate: 1.0e-6
     weight_decay: 0.01
-    per_device_train_batch_size: 1
-    gradient_accumulation_steps: 8
-    warmup_steps: 20
+    per_device_train_batch_size: 8
+    gradient_accumulation_steps: 2
+    warmup_steps: 10
     num_train_epochs: 1
   data_args:
     template: native
@@ -94,7 +126,7 @@ actor_train:
   device_mapping: "list(range(0,2))"
   infer_batch_size: 2
 
-# Actor Inference (GPU 2 only)
+# Actor Inference (GPU 2)
 actor_infer:
   model_args:
     attn_implementation: fa2
@@ -107,7 +139,7 @@ actor_infer:
     num_beams: 1
     temperature: 0.6
     num_return_sequences: ${num_return_sequences_in_group}
-    repetition_penalty: 1.1
+    repetition_penalty: 1.3
   data_args:
     template: native
   strategy_args:
@@ -120,82 +152,49 @@ actor_infer:
   device_mapping: "[2]"
   infer_batch_size: 1
 
-# Rewards (GPU 3 only)
-# Current mode: inference (each reward worker holds GPU and does local inference)
+# ============================================================================
+# REWARD WORKERS
+# ============================================================================
 rewards:
+  # Training reward: Verifier model via vLLM server
   proof_gen:
     worker_cls: roll.pipeline.rlvr.rewards.proof_verifier_reward_worker.ProofVerifierRewardWorker
-    judge_model_type: inference
+    judge_model_type: vllm_server
+    vllm_server_gpu: 3
+    vllm_server_port: 8000
+    vllm_server_gpu_memory_utilization: 0.85
+    vllm_server_max_model_len: 8192
     tag_included: [proof_gen]
+    world_size: 64  # vLLM server handles batching, don't need many workers
     model_args:
       model_name_or_path: ${reward_pretrain}
-      attn_implementation: fa2
-      disable_gradient_checkpointing: true
-      dtype: bf16
     generating_args:
-      max_new_tokens: 2048
+      max_new_tokens: 3072
       top_p: 0.8
       top_k: 50
       num_beams: 1
       temperature: 0.3
       num_return_sequences: 1
+      repetition_penalty: 1.2
     data_args:
       template: native
-    strategy_args:
-      strategy_name: vllm
-      strategy_config:
-        gpu_memory_utilization: 0.85
-        enforce_eager: false
-        block_size: 16
-        max_model_len: 8192
-        load_format: auto  # IMPORTANT: actually load weights for reward model
-    device_mapping: "[3]"
-    infer_batch_size: 4
 
-# ============================================================================
-# CLUSTER MODE CONFIGURATION (for continuous batching)
-# Uncomment to use cluster mode where reward_infer handles all inference
-# and reward workers only do judge logic without GPU.
-# This provides better GPU utilization through vLLM continuous batching.
-# ============================================================================
+  # Validation reward: Rule-based math answer verification
+  math_rule:
+    worker_cls: roll.pipeline.rlvr.rewards.math_rule_reward_worker.MathRuleRewardWorker
+    tag_included: [aime2024, amc2023, math500, minerva]
+    world_size: 8  # CPU-only rule matching, few workers needed
+    model_args:
+      model_name_or_path: ${pretrain}  # Just for tokenizer
+    data_args:
+      template: native
 
-# # Reward Inference Service (GPU 3, vLLM server mode)
-# reward_infer:
-#   model_args:
-#     model_name_or_path: ${reward_pretrain}
-#     attn_implementation: fa2
-#     disable_gradient_checkpointing: true
-#     dtype: bf16
-#   generating_args:
-#     max_new_tokens: 2048
-#     top_p: 0.8
-#     top_k: 50
-#     num_beams: 1
-#     temperature: 0.3
-#     num_return_sequences: 1
-#   data_args:
-#     template: native
-#   strategy_args:
-#     strategy_name: vllm
-#     strategy_config:
-#       gpu_memory_utilization: 0.85
-#       enforce_eager: false
-#       block_size: 16
-#       max_model_len: 8192
-#       load_format: auto
-#       engine_mode: async  # Enable continuous batching
-#   device_mapping: "[3]"
-#   infer_batch_size: 4
-
-# # Rewards (cluster mode - no GPU, only judge logic)
-# rewards:
-#   proof_gen:
-#     worker_cls: roll.pipeline.rlvr.rewards.proof_verifier_reward_worker.ProofVerifierRewardWorker
-#     judge_model_type: cluster  # Use reward_infer cluster
-#     tag_included: [proof_gen]
-#     world_size: 16  # Can scale up since no GPU needed
-#     # No device_mapping, model_args, strategy_args needed in cluster mode
-#     model_args:
-#       model_name_or_path: ${reward_pretrain}  # For tokenizer only
-#     data_args:
-#       template: native
+  # Validation reward: Multiple choice answer verification
+  multiple_choice:
+    worker_cls: roll.pipeline.rlvr.rewards.multiple_choice_boxed_rule_reward_worker.MultipleChoiceBoxedRuleRewardWorker
+    tag_included: [gpqa_diamond]
+    world_size: 8  # CPU-only rule matching, few workers needed
+    model_args:
+      model_name_or_path: ${pretrain}  # Just for tokenizer
+    data_args:
+      template: native

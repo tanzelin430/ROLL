@@ -48,6 +48,16 @@ def qwen3_chat_template(tokenizer: "PreTrainedTokenizer", conversation, tools=No
     kwargs["enable_thinking"] = True
     return tokenizer.apply_chat_template(conversation, tools, documents, **kwargs)
 
+
+@register_chat_template("qwen3_no_think")
+def qwen3_no_think_chat_template(tokenizer: "PreTrainedTokenizer", conversation, tools=None, documents=None, **kwargs):
+    """Qwen3 template with thinking disabled (enable_thinking=False)."""
+    kwargs["tokenize"] = False
+    kwargs["add_generation_prompt"] = kwargs.get("add_generation_prompt", True)
+    kwargs["enable_thinking"] = False
+    return tokenizer.apply_chat_template(conversation, tools, documents, **kwargs)
+
+
 @register_chat_template("qwen2_5_dpo")
 def dpo_chat_template(tokenizer: "PreTrainedTokenizer", conversation, tools=None, documents=None, **kwargs):
     kwargs["tokenize"] = False

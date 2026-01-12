@@ -1,0 +1,243 @@
+defaults:
+  - ../config/deepspeed_zero2@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+# ============================================================================
+# EXPERIMENT: Direct RL without SFT, No Thinking Mode (4B, 4 GPU)
+# - Generator: Original Qwen3-4B (no SFT, no thinking)
+# - Verifier: Original Qwen3-4B (zero-shot, no thinking)
+# - Tests format reward + rep penalty + verifier score combination
+# ============================================================================
+exp_name: "qwen3-4B-rl-no-sft-no-think"
+seed: 42
+logging_dir: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_logs
+output_dir: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_output_4B_no_sft
+
+checkpoint_config:
+  type: file_system
+  output_dir: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_ckpt_4B_no_sft
+
+track_with: wandb
+tracker_kwargs:
+  entity: tanzl-ustc
+  project: psro-math
+  mode: online
+
+num_gpus_per_node: 4
+
+max_steps: 100
+save_steps: 50
+max_ckpt_to_keep: 2
+logging_steps: 1
+eval_steps: 10
+resume_from_checkpoint: false
+
+# Batch settings (4B can use larger batch than 8B)
+rollout_batch_size: 16
+prompt_length: 2048
+response_length: 4096
+
+# Async RL mode
+async_generation_ratio: 2
+generate_opt_level: 1
+is_num_return_sequences_expand: true
+
+# GRPO settings
+num_return_sequences_in_group: 8
+ppo_epochs: 1
+adv_estimator: "grpo"
+use_kl_loss: false
+init_kl_coef: 0.0
+
+# Clip settings
+reward_clip: 10
+advantage_clip: 2.0
+
+# Normalize
+norm_mean_type: batch
+norm_std_type: batch
+
+# Data mask
+max_len_mask: true
+difficulty_mask: false
+
+# Advantage
+whiten_advantages: true
+
+# ============================================================================
+# MODEL PATHS - ORIGINAL Qwen3-4B (NO SFT!)
+# ============================================================================
+pretrain: /mnt/shared-storage-user/ma4agi-gpu/data/model/Qwen3-4B
+reward_pretrain: /mnt/shared-storage-user/ma4agi-gpu/data/model/Qwen3-4B
+
+# ============================================================================
+# TAG TO DOMAIN MAPPING
+# ============================================================================
+tag_2_domain:
+  # Training
+  proof_gen: proof_gen
+  # Math evaluation
+  aime2024: math_rule
+  aime2025: math_rule
+  math500: math_rule
+  # Multiple choice evaluation
+  gpqa_diamond: multiple_choice
+  # Code evaluation
+  humaneval: humaneval
+  # Logic evaluation
+  zebra_puzzle: zebra_puzzle
+
+# ============================================================================
+# VALIDATION: AIME24, AIME25, MATH500, GPQA-Diamond, HumanEval, ZebraLogic
+# ============================================================================
+validation:
+  data_args:
+    template: qwen3_no_think
+    file_name:
+      - /mnt/shared-storage-user/ma4agi-gpu/data/eval_benchmarks/eval_final.jsonl
+    messages: messages
+  generating_args:
+    max_new_tokens: ${response_length}
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    min_p: 0.0
+    num_beams: 1
+    num_return_sequences: 1
+    repetition_penalty: 1.1
+
+# ============================================================================
+# 4 GPU ALLOCATION:
+#   GPU 0-1: Actor Training (DeepSpeed ZeRO-2)
+#   GPU 2: Actor Inference (vLLM)
+#   GPU 3: Reward Model vLLM Server (Verifier)
+# ============================================================================
+
+# Actor Training (GPU 0-1)
+actor_train:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0.01
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 4
+    warmup_steps: 10
+    num_train_epochs: 1
+  data_args:
+    template: qwen3_no_think
+    file_name:
+      - /mnt/shared-storage-user/tanzelin-p/rl_data/proof_gen_rl_10k.jsonl
+    domain_interleave_probs:
+      proof_gen: 1.0
+    dataset_dir: /mnt/shared-storage-user/tanzelin-p/rl_data
+    messages: messages
+    interleave_probs: "1.0"
+    preprocessing_num_workers: 8
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero2}
+  device_mapping: "list(range(0,2))"
+  infer_batch_size: 4
+
+# Actor Inference (GPU 2)
+actor_infer:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: ${response_length}
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    min_p: 0.0
+    num_beams: 1
+    num_return_sequences: ${num_return_sequences_in_group}
+    repetition_penalty: 1.1
+  data_args:
+    template: qwen3_no_think
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.85
+      enforce_eager: false
+      block_size: 16
+      max_model_len: 8192
+  device_mapping: "[2]"
+  infer_batch_size: 2
+
+# ============================================================================
+# REWARD WORKERS
+# ============================================================================
+rewards:
+  # Training reward: Verifier model via vLLM server (GPU 3)
+  proof_gen:
+    worker_cls: roll.pipeline.rlvr.rewards.proof_verifier_reward_worker.ProofVerifierRewardWorker
+    judge_model_type: vllm_server
+    vllm_server_gpu: "3"
+    vllm_server_port: 8000
+    vllm_server_gpu_memory_utilization: 0.85
+    vllm_server_max_model_len: 10240
+    tag_included: [proof_gen]
+    world_size: 32
+    model_args:
+      model_name_or_path: ${reward_pretrain}
+    generating_args:
+      max_new_tokens: 3072
+      temperature: 0.3
+      top_p: 0.8
+      top_k: 50
+      num_beams: 1
+      num_return_sequences: 1
+      repetition_penalty: 1.1
+    data_args:
+      template: qwen3_no_think
+
+  # Math evaluation: AIME24, AIME25, MATH500
+  math_rule:
+    worker_cls: roll.pipeline.rlvr.rewards.math_rule_reward_worker.MathRuleRewardWorker
+    tag_included: [aime2024, aime2025, math500]
+    world_size: 4
+    model_args:
+      model_name_or_path: ${pretrain}
+    data_args:
+      template: qwen3_no_think
+
+  # Multiple choice evaluation: GPQA-Diamond
+  multiple_choice:
+    worker_cls: roll.pipeline.rlvr.rewards.multiple_choice_boxed_rule_reward_worker.MultipleChoiceBoxedRuleRewardWorker
+    tag_included: [gpqa_diamond]
+    world_size: 4
+    model_args:
+      model_name_or_path: ${pretrain}
+    data_args:
+      template: qwen3_no_think
+
+  # Code evaluation: HumanEval
+  humaneval:
+    worker_cls: roll.pipeline.rlvr.rewards.code_sandbox_reward_worker.CodeSandboxRewardWorker
+    tag_included: [humaneval]
+    world_size: 4
+    use_local: true
+    model_args:
+      model_name_or_path: ${pretrain}
+    data_args:
+      template: qwen3_no_think
+
+  # Logic evaluation: ZebraLogic
+  zebra_puzzle:
+    worker_cls: roll.pipeline.rlvr.rewards.zebra_puzzle_reward_worker.ZebraPuzzleRewardWorker
+    tag_included: [zebra_puzzle]
+    world_size: 4
+    model_args:
+      model_name_or_path: ${pretrain}
+    data_args:
+      template: qwen3_no_think

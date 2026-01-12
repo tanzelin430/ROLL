@@ -1,0 +1,243 @@
+defaults:
+  - ../config/deepspeed_zero2@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+# ============================================================================
+# EXPERIMENT: Direct RL with Thinking (No SFT)
+# - Generator: Original Qwen3-8B with enable_thinking=True (template: qwen3)
+# - Verifier: Original Qwen3-8B without thinking (template: qwen3_no_think)
+# - Thinking process participates in RL
+# ============================================================================
+exp_name: "qwen3-8B-rl-thinking-no-sft"
+seed: 42
+logging_dir: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_logs
+output_dir: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_output_thinking
+
+checkpoint_config:
+  type: file_system
+  output_dir: /mnt/shared-storage-user/tanzelin-p/proof_gen_rl_ckpt_thinking
+
+track_with: wandb
+tracker_kwargs:
+  entity: tanzl-ustc
+  project: psro-math
+  mode: online
+
+num_gpus_per_node: 8
+
+max_steps: 1000
+save_steps: 100
+max_ckpt_to_keep: 1
+logging_steps: 1
+eval_steps: 5
+resume_from_checkpoint: false
+
+# ============================================================================
+# Batch settings (adjusted for long thinking outputs)
+# Test showed: thinking ~3k-13k tokens, solution ~1k tokens
+# ============================================================================
+rollout_batch_size: 32
+prompt_length: 2048
+response_length: 16384
+
+# Async RL mode
+async_generation_ratio: 2
+generate_opt_level: 1
+is_num_return_sequences_expand: true
+
+# GRPO settings
+num_return_sequences_in_group: 8
+ppo_epochs: 1
+adv_estimator: "grpo"
+use_kl_loss: false
+init_kl_coef: 0.0
+
+# Clip settings
+reward_clip: 10
+advantage_clip: 2.0
+
+# Normalize
+norm_mean_type: batch
+norm_std_type: batch
+
+# Data mask
+max_len_mask: true
+difficulty_mask: false
+
+# Advantage
+whiten_advantages: true
+
+# ============================================================================
+# MODEL PATHS - ORIGINAL Qwen3-8B (NO SFT!)
+# ============================================================================
+pretrain: /mnt/shared-storage-user/ma4agi-gpu/data/model/Qwen3-8B
+reward_pretrain: /mnt/shared-storage-user/ma4agi-gpu/data/model/Qwen3-8B
+
+# ============================================================================
+# TAG TO DOMAIN MAPPING
+# ============================================================================
+tag_2_domain:
+  proof_gen: proof_gen
+  math500: math_rule
+  # aime2024: math_rule
+  # amc2023: math_rule
+  # minerva: math_rule
+  # supergpqa: multiple_choice
+  # zebra_puzzle: zebra_puzzle
+  # humaneval: humaneval
+
+# ============================================================================
+# VALIDATION (only math500 for testing)
+# ============================================================================
+validation:
+  data_args:
+    template: qwen3  # Enable thinking for validation
+    file_name:
+      - /mnt/shared-storage-user/ma4agi-gpu/data/eval_benchmarks/math500_roll.jsonl
+      # - /mnt/shared-storage-user/ma4agi-gpu/data/eval_benchmarks/zebra_puzzle_200_roll.jsonl
+      # - /mnt/shared-storage-user/ma4agi-gpu/data/eval_benchmarks/humaneval_164_roll.jsonl
+      # - /mnt/shared-storage-user/ma4agi-gpu/data/eval_benchmarks/supergpqa_200_roll.jsonl
+    messages: messages
+  generating_args:
+    max_new_tokens: ${response_length}
+    repetition_penalty: 1.1
+    top_p: 0.8
+    top_k: 50
+    num_beams: 1
+    temperature: 0.6
+    num_return_sequences: 1
+
+# ============================================================================
+# 8 GPU ALLOCATION:
+#   GPU 0-3: Actor Training (DeepSpeed ZeRO-2, 4 cards)
+#   GPU 4-5: Actor Inference (vLLM, tensor_parallel=2)
+#   GPU 6-7: Reward Model vLLM Server (Verifier, TP=2)
+# ============================================================================
+
+# Actor Training (GPU 0-3)
+actor_train:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  training_args:
+    learning_rate: 1.0e-6
+    weight_decay: 0.01
+    per_device_train_batch_size: 4
+    gradient_accumulation_steps: 4
+    warmup_steps: 3
+    num_train_epochs: 1
+  data_args:
+    template: qwen3  # Enable thinking!
+    file_name:
+      - /mnt/shared-storage-user/tanzelin-p/rl_data/proof_gen_rl_100k.jsonl
+    domain_interleave_probs:
+      proof_gen: 1.0
+    dataset_dir: /mnt/shared-storage-user/tanzelin-p/rl_data
+    messages: messages
+    interleave_probs: "1.0"
+    preprocessing_num_workers: 8
+  strategy_args:
+    strategy_name: deepspeed_train
+    strategy_config: ${deepspeed_zero2}
+  device_mapping: "list(range(0,4))"
+  infer_batch_size: 2
+
+# Actor Inference (GPU 4-5, 2 cards - better utilization than TP=4)
+actor_infer:
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: ${response_length}
+    top_p: 0.8
+    top_k: 50
+    num_beams: 1
+    temperature: 0.6
+    num_return_sequences: ${num_return_sequences_in_group}
+    repetition_penalty: 1.1
+  data_args:
+    template: qwen3  # Enable thinking!
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      gpu_memory_utilization: 0.90
+      enforce_eager: false
+      block_size: 16
+      max_model_len: 20480
+      tensor_parallel_size: 2
+  device_mapping: "[4, 5]"
+  infer_batch_size: 2
+
+# ============================================================================
+# REWARD WORKERS
+# ============================================================================
+rewards:
+  # Training reward: Verifier (WITH thinking for better GPU utilization)
+  proof_gen:
+    worker_cls: roll.pipeline.rlvr.rewards.proof_verifier_reward_worker.ProofVerifierRewardWorker
+    judge_model_type: vllm_server
+    vllm_server_gpu: "6,7"
+    vllm_server_port: 8000
+    vllm_server_gpu_memory_utilization: 0.90
+    vllm_server_max_model_len: 25600
+    vllm_server_tensor_parallel_size: 2
+    tag_included: [proof_gen]
+    world_size: 32
+    model_args:
+      model_name_or_path: ${reward_pretrain}
+    generating_args:
+      max_new_tokens: 16384
+      top_p: 0.8
+      top_k: 50
+      num_beams: 1
+      temperature: 0.3
+      num_return_sequences: 1
+      repetition_penalty: 1.1
+    data_args:
+      template: qwen3  # Verifier WITH thinking for better utilization
+
+  # Validation reward: math500 only for testing
+  math_rule:
+    worker_cls: roll.pipeline.rlvr.rewards.math_rule_reward_worker.MathRuleRewardWorker
+    tag_included: [math500]  # Only math500 for testing
+    world_size: 4
+    model_args:
+      model_name_or_path: ${pretrain}
+    data_args:
+      template: qwen3
+
+  # Commented out for testing - uncomment when needed
+  # multiple_choice:
+  #   worker_cls: roll.pipeline.rlvr.rewards.multiple_choice_boxed_rule_reward_worker.MultipleChoiceBoxedRuleRewardWorker
+  #   tag_included: [supergpqa]
+  #   world_size: 8
+  #   model_args:
+  #     model_name_or_path: ${pretrain}
+  #   data_args:
+  #     template: qwen3
+
+  # zebra_puzzle:
+  #   worker_cls: roll.pipeline.rlvr.rewards.zebra_puzzle_reward_worker.ZebraPuzzleRewardWorker
+  #   tag_included: [zebra_puzzle]
+  #   world_size: 4
+  #   model_args:
+  #     model_name_or_path: ${pretrain}
+  #   data_args:
+  #     template: qwen3
+
+  # humaneval:
+  #   worker_cls: roll.pipeline.rlvr.rewards.code_sandbox_reward_worker.CodeSandboxRewardWorker
+  #   tag_included: [humaneval]
+  #   world_size: 8
+  #   use_local: true
+  #   model_args:
+  #     model_name_or_path: ${pretrain}
+  #   data_args:
+  #     template: qwen3

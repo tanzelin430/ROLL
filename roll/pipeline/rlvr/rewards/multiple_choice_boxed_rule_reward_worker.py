@@ -20,66 +20,50 @@ from roll.models.model_providers import default_reward_model_provider, default_t
 from typing import Union, Dict, List
 
 from roll.utils.logging import get_logger
+from roll.pipeline.rlvr.rewards.utils import extract_option_letter
 
 logger = get_logger()  # 获取日志记录器实例
 
-def extract_after_last_think(input_string, end_think="</think>"):
+
+def multiple_choice_boxed_reward_fn(response: str, ground_truth: str, valid_options: str = 'ABCDEFGHIJ'):
     """
-    提取输入字符串中最后一个"end_think"标签之后的内容，
-    并移除结果字符串开头的所有换行符。
+    Extract and verify multiple choice answer from response.
+
+    Supports options A-J (configurable via valid_options).
+    Uses robust extraction with multiple strategies:
+    1. \\boxed{} content
+    2. "Final Answer:" pattern
+    3. "The answer is:" pattern
+    4. Last valid option letter in text
 
     Args:
-    input_string: 原始字符串。
+        response: Model response text
+        ground_truth: Expected answer (e.g., "A", "B", etc.)
+        valid_options: String of valid option letters (default: A-J)
 
     Returns:
-    提取并处理后的字符串。如果未找到"end_think"标签，则返回空字符串。
+        Tuple of (extracted_answer, reward, format_flag, correct_flag)
     """
-    last_index = input_string.rfind(end_think)
+    # Use robust extraction from utils
+    extracted_answer = extract_option_letter(response, valid_options)
 
-    if last_index == -1:
-        return input_string  # 或者根据需要返回 None 或原始字符串
+    # Check if answer was found in \boxed{}
+    format_flag = '\\boxed{' in response and extracted_answer is not None
 
-    start_pos = last_index + len(end_think)
-    extracted_part = input_string[start_pos:]
-    cleaned_part = extracted_part.lstrip("\n")
-
-    return cleaned_part
-
-
-def multiple_choice_boxed_reward_fn(response, ground_truth, reward_type=None):
-
-    format_flag = False
+    # Check correctness
     correct_flag = False
+    if extracted_answer is not None and ground_truth:
+        # Compare first character (ground_truth might be "A" or "A.")
+        gt_letter = ground_truth[0].upper() if ground_truth else None
+        correct_flag = (extracted_answer == gt_letter)
 
-    # 1. format
-    # 找到所有的 \\boxed{} 匹配项
-    box_matches = re.findall(r"\\boxed\{([^}]+)\}", response)
-    # 如果没有找到 \\boxed{} 则返回 None
-    if not box_matches:
-        lower_response = response.lower()
-        last_answer_index = lower_response.rfind("answer is")
-        if last_answer_index == -1:
-            extracted_answer = response
-        else:
-            extracted_answer = response[last_answer_index + 9 :]
-    # 获取最后一个 \\boxed{} 的内容
-    else:
-        format_flag = True
-        extracted_answer = box_matches[-1]
-
-    # 2. correct
-    for char in extracted_answer:
-        if char.isupper():
-            if char == ground_truth[0]:
-                correct_flag = True
-            break
-
+    # Compute reward: require both format and correctness for full reward
     if correct_flag and format_flag:
         reward = 1.0
     else:
-        reward = 0
+        reward = 0.0
 
-    return extracted_answer, reward, format_flag, correct_flag
+    return extracted_answer or "", reward, format_flag, correct_flag
 
 
 class MultipleChoiceBoxedRuleRewardWorker(Worker):
@@ -99,7 +83,8 @@ class MultipleChoiceBoxedRuleRewardWorker(Worker):
         response_text_list = self.tokenizer.batch_decode(data.batch["responses"], skip_special_tokens=True)
         batch_size = len(response_text_list)
 
-        prompts = data.non_tensor_batch["prompt"]
+        # Decode prompts from tensor (same as MathRuleRewardWorker)
+        prompts = self.tokenizer.batch_decode(data.batch["prompts"], skip_special_tokens=False)
         ground_truths = data.non_tensor_batch["ground_truth"]
         tags = data.non_tensor_batch["tag"]
 
@@ -113,17 +98,14 @@ class MultipleChoiceBoxedRuleRewardWorker(Worker):
             resp_text_without_sptoken = (
                 ori_resp_text.replace("<|endoftext|>", "").replace("<pad>", "").replace("<|im_end|>", "")
             )
-            answer_text = extract_after_last_think(resp_text_without_sptoken)
 
+            # extract_option_letter handles both with/without </think> tags
             extracted_answer, multiple_choice_boxed_reward, format_flag, correct_flag = multiple_choice_boxed_reward_fn(
-                answer_text, ground_truth
+                resp_text_without_sptoken, ground_truth
             )
 
-            # score应该为0或者1，标志模型回复的对错
-            if multiple_choice_boxed_reward > 0.5:
-                score = 1.0
-            else:
-                score = 0.0
+            # score: 1 for correct, 0 for incorrect
+            score = 1.0 if correct_flag else 0.0
 
             # 存到 multiple_choice_boxed_rewards
             multiple_choice_boxed_rewards.append(multiple_choice_boxed_reward)
@@ -136,9 +118,9 @@ class MultipleChoiceBoxedRuleRewardWorker(Worker):
                         "format_flag": format_flag,
                         "correct_flag": correct_flag,
                         "prompt": str(prompt),
-                        "response": str(extracted_answer),
+                        "extracted_answer": str(extracted_answer),
                         "ground_truth": str(ground_truth),
-                        "ori_response": str(resp_text_without_sptoken),
+                        "response": str(resp_text_without_sptoken),
                     },
                     ensure_ascii=False,
                 )

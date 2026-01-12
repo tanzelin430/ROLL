@@ -27,6 +27,7 @@ from roll.models.model_providers import default_tokenizer_provider
 from roll.pipeline.base_pipeline import BasePipeline
 from roll.pipeline.rlvr.rlvr_config import RLVRConfig
 from roll.pipeline.rlvr.utils import dump_rollout_to_specific_path
+from roll.pipeline.rlvr.rewards.proof_verifier_reward_worker import extract_solution_after_think
 from roll.utils.functionals import (
     RunningMoments,
     agg_loss,
@@ -388,8 +389,9 @@ class RLVRPipeline(BasePipeline):
         port = getattr(config, 'vllm_server_port', 8000)
         gpu_mem = getattr(config, 'vllm_server_gpu_memory_utilization', 0.85)
         max_model_len = getattr(config, 'vllm_server_max_model_len', 8192)
+        tensor_parallel_size = getattr(config, 'vllm_server_tensor_parallel_size', 1)
 
-        logger.info(f"Starting vLLM server for reward model on GPU {gpu_id}, port {port}")
+        logger.info(f"Starting vLLM server for reward model on GPU {gpu_id}, port {port}, TP={tensor_parallel_size}")
         logger.info(f"Model: {model_path}")
 
         # Start server
@@ -399,6 +401,7 @@ class RLVRPipeline(BasePipeline):
             port=port,
             gpu_memory_utilization=gpu_mem,
             max_model_len=max_model_len,
+            tensor_parallel_size=tensor_parallel_size,
         )
         server_url = self.vllm_server_manager.start()
 
@@ -840,7 +843,9 @@ class RLVRPipeline(BasePipeline):
                     responses = self.tokenizer.batch_decode(
                         generate_output.batch["responses"], skip_special_tokens=True
                     )
-                    generate_examples = [{"prompt": p, "response": r} for p, r in zip(prompts, responses)][:10]
+                    # Extract solution part (after </think>) for cleaner logging
+                    solutions = [extract_solution_after_think(r) for r in responses]
+                    generate_examples = [{"prompt": p, "solution": s} for p, s in zip(prompts, solutions)][:10]
                     logger.info(json.dumps(generate_examples, ensure_ascii=False))
                     logger.info(json.dumps(metrics, ensure_ascii=False))
 
@@ -861,9 +866,16 @@ class RLVRPipeline(BasePipeline):
             batch.meta_info["is_offload_states"] = False
             batch.meta_info["generation_config"] = self.pipeline_config.validation.generating_args.to_dict()
             if not self.pipeline_config.async_pipeline:
+                # Non-async mode: start server, load states, and start sampling here
                 self.actor_infer.start_server(data=DataProto(meta_info=batch.meta_info))
                 for reward_cluster in self.rewards.values():
                     reward_cluster.load_states()
+                ray.get(
+                    self.val_generate_scheduler.start_sampling.remote(data=batch, batch_size=len(self.val_dataset)),
+                    timeout=self.pipeline_config.rpc_timeout,
+                )
+            # For async pipeline: start_sampling was already called at step start (line 580)
+            # to run eval in parallel with train rollout. We only get_batch here.
             generate_output: DataProto = ray.get(
                 self.val_generate_scheduler.get_batch.remote(data=batch, batch_size=len(self.val_dataset)),
                 timeout=self.pipeline_config.rpc_timeout,
