@@ -106,7 +106,12 @@ class RewardConfig(WorkerConfig):
         default_factory=RewardFilterConfig,
         metadata={"help": "Arguments passed to reward response filtering"},
     )
-
+    # PSRO verifier ensemble: mapping of verifier name to LoRA path
+    lora_verifiers: Dict[str, str] = field(
+        default_factory=dict,
+        metadata={"help": "Dict mapping verifier name to LoRA adapter path for PSRO ensemble. "
+                  "Example: {'V1': '/path/to/v1', 'V2': '/path/to/v2', 'V3': '/path/to/v3'}"}
+    )
 
 
 @dataclass

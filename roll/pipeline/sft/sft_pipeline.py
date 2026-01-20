@@ -1,3 +1,4 @@
+import os
 from typing import Any
 
 import datasets
@@ -234,6 +235,24 @@ class SFTPipeline(BasePipeline):
                 logger.info(f"pipeline step {global_step} finished...")
 
                 global_step += 1
+
+        # Force save final checkpoint if not already saved
+        final_step = global_step - 1  # Last completed step
+        if final_step > 0 and final_step % self.pipeline_config.save_steps != 0:
+            logger.info(f"Saving final checkpoint at step {final_step}...")
+            ckpt_metrics_refss = []
+            for cluster in self.checkpoint_clusters:
+                ckpt_metrics_refss.append(cluster.do_checkpoint(global_step=final_step, blocking=False))
+
+            for ckpt_metrics_refs in ckpt_metrics_refss:
+                ckpt_metrics = DataProto.materialize_concat(data_refs=ckpt_metrics_refs)
+
+            ckpt_id = f"checkpoint-{final_step}"
+            pipeline_save_dir = os.path.join(self.pipeline_config.output_dir, "pipeline", ckpt_id)
+            save_dir = os.path.join(self.pipeline_config.output_dir, "pipeline", ckpt_id, "pipeline")
+            self.state.save_to_json(save_dir=save_dir, tag="pipeline")
+            self.state.save_rng_state(save_dir=save_dir, tag="pipeline")
+            logger.info(f"Final checkpoint saved at step {final_step}")
 
         logger.info("pipeline complete!")
 

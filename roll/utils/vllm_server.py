@@ -46,6 +46,8 @@ class VLLMServerManager:
         startup_timeout: int = 300,
         log_file: Optional[str] = None,
         tensor_parallel_size: int = 1,
+        lora_modules: Optional[dict] = None,
+        max_lora_rank: int = 64,
     ):
         """
         Initialize the vLLM server manager.
@@ -62,6 +64,8 @@ class VLLMServerManager:
             startup_timeout: Timeout in seconds to wait for server startup
             log_file: Path to log file for server output (default: /tmp/vllm_server_{port}.log)
             tensor_parallel_size: Number of GPUs for tensor parallelism (default: 1)
+            lora_modules: Dict mapping LoRA name to path (e.g., {"V1": "/path/to/v1", "V2": "/path/to/v2"})
+            max_lora_rank: Maximum LoRA rank (default: 64)
         """
         self.model_path = model_path
         self.gpu_id = str(gpu_id)  # Ensure string for CUDA_VISIBLE_DEVICES
@@ -73,6 +77,8 @@ class VLLMServerManager:
         self.startup_timeout = startup_timeout
         self.log_file = log_file or f"/tmp/vllm_server_{port}.log"
         self.tensor_parallel_size = tensor_parallel_size
+        self.lora_modules = lora_modules
+        self.max_lora_rank = max_lora_rank
 
         self.process: Optional[subprocess.Popen] = None
         self.url: Optional[str] = None
@@ -110,6 +116,14 @@ class VLLMServerManager:
         # Add tensor parallel if > 1
         if self.tensor_parallel_size > 1:
             cmd.extend(["--tensor-parallel-size", str(self.tensor_parallel_size)])
+
+        # Add LoRA support if configured
+        if self.lora_modules:
+            cmd.extend(["--enable-lora", "--max-lora-rank", str(self.max_lora_rank)])
+            # Format: --lora-modules name1=path1 name2=path2
+            lora_args = [f"{name}={path}" for name, path in self.lora_modules.items()]
+            cmd.extend(["--lora-modules"] + lora_args)
+            logger.info(f"Enabling LoRA with modules: {list(self.lora_modules.keys())}")
 
         # Set environment for specific GPU(s)
         env = os.environ.copy()
@@ -230,6 +244,8 @@ def get_or_start_vllm_server(
     gpu_memory_utilization: float = 0.85,
     max_model_len: int = 8192,
     tensor_parallel_size: int = 1,
+    lora_modules: Optional[dict] = None,
+    max_lora_rank: int = 64,
 ) -> str:
     """
     Get or start a global vLLM server instance.
@@ -244,6 +260,8 @@ def get_or_start_vllm_server(
         gpu_memory_utilization: GPU memory utilization
         max_model_len: Maximum model context length
         tensor_parallel_size: Number of GPUs for tensor parallelism
+        lora_modules: Dict mapping LoRA name to path for multi-LoRA support
+        max_lora_rank: Maximum LoRA rank (default: 64)
 
     Returns:
         str: The server URL
@@ -261,6 +279,8 @@ def get_or_start_vllm_server(
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
         tensor_parallel_size=tensor_parallel_size,
+        lora_modules=lora_modules,
+        max_lora_rank=max_lora_rank,
     )
 
     return _global_server_manager.start()

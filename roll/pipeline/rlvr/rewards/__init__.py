@@ -6,5 +6,6 @@ from roll.pipeline.rlvr.rewards.llm_judge_reward_worker import LLMJudgeRewardWor
 from roll.pipeline.rlvr.rewards.math_rule_reward_worker import MathRuleRewardWorker
 from roll.pipeline.rlvr.rewards.multiple_choice_boxed_rule_reward_worker import MultipleChoiceBoxedRuleRewardWorker
 from roll.pipeline.rlvr.rewards.proof_verifier_reward_worker import ProofVerifierRewardWorker
+from roll.pipeline.rlvr.rewards.psro_verifier_reward_worker import PSROVerifierRewardWorker
 from roll.pipeline.rlvr.rewards.zebra_puzzle_reward_worker import ZebraPuzzleRewardWorker
 

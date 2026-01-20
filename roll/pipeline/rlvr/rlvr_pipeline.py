@@ -356,7 +356,8 @@ class RLVRPipeline(BasePipeline):
         This method:
         1. Checks if any reward worker has judge_model_type='vllm_server'
         2. If so, starts a vLLM server with the configured parameters
-        3. Updates the reward worker config with the server URL
+        3. If lora_verifiers is configured, starts server with multi-LoRA support
+        4. Updates the reward worker config with the server URL
         """
         # Find reward workers that need vLLM server
         vllm_server_configs = []
@@ -391,6 +392,12 @@ class RLVRPipeline(BasePipeline):
         max_model_len = getattr(config, 'vllm_server_max_model_len', 8192)
         tensor_parallel_size = getattr(config, 'vllm_server_tensor_parallel_size', 1)
 
+        # Check for LoRA verifiers (PSRO mode)
+        lora_modules = None
+        if getattr(config, 'lora_verifiers', None):
+            lora_modules = dict(config.lora_verifiers)
+            logger.info(f"Enabling multi-LoRA support: {list(lora_modules.keys())}")
+
         logger.info(f"Starting vLLM server for reward model on GPU {gpu_id}, port {port}, TP={tensor_parallel_size}")
         logger.info(f"Model: {model_path}")
 
@@ -402,6 +409,7 @@ class RLVRPipeline(BasePipeline):
             gpu_memory_utilization=gpu_mem,
             max_model_len=max_model_len,
             tensor_parallel_size=tensor_parallel_size,
+            lora_modules=lora_modules,
         )
         server_url = self.vllm_server_manager.start()
 
