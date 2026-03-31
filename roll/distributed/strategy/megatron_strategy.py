@@ -411,8 +411,55 @@ class MegatronInferStrategy(InferenceStrategy):
         attention_mask = data.batch["attention_mask"]
         labels = data.batch["labels"] if "labels" in data.batch else None  # labels is only used for sft
         packed_seq_params = None
+        _tree_hooks = []
+        _tree_meta = None
 
-        if self.use_sequence_packing:
+        # Clear tree context from any previous microbatch so hooks fall through
+        # to standard attention for non-tree microbatches.
+        from roll.utils.tree_attention_megatron import _tree_ctx, set_tree_context
+        set_tree_context(None, None)
+
+        # --- Tree attention: linearize instead of standard packing ---
+        _use_tree = (
+            self.use_sequence_packing
+            and getattr(self.worker_config.model_args, "use_tree_attention", False)
+            and "traj_group_id" in data.non_tensor_batch
+            and mpu.get_context_parallel_world_size() == 1
+            and mpu.get_pipeline_model_parallel_world_size() == 1
+        )
+        if _use_tree:
+            from roll.utils.tree_attention_megatron import (
+                detect_tree_attention,
+                linearize_tree_batch,
+                install_tree_attention_hooks,
+            )
+
+            _tree_meta = detect_tree_attention(
+                input_ids, attention_mask, data.non_tensor_batch["traj_group_id"]
+            )
+
+        if _tree_meta is not None:
+            # Linearize: [prefix | suffix_0 | suffix_1 | ...] — prefix computed ONCE
+            pad_factor = self._get_pad_factor()
+            input_ids, packed_seq_params, _tree_meta = linearize_tree_batch(
+                input_ids, attention_mask, _tree_meta, pad_factor=pad_factor,
+            )
+            _tree_cu_pad = packed_seq_params.cu_seqlens_q_padded
+
+            # Install hooks only once (first tree microbatch); for subsequent
+            # microbatches just update the thread-local context so existing hooks
+            # pick up the new metadata.
+            _existing_hooks = getattr(self, '_tree_hooks_pending_cleanup', None)
+            if _existing_hooks:
+                # Hooks already installed from a previous microbatch — just update context
+                set_tree_context(_tree_meta, _tree_cu_pad)
+            else:
+                _tree_hooks = install_tree_attention_hooks(model, _tree_meta, _tree_cu_pad)
+                self._tree_hooks_pending_cleanup = _tree_hooks
+
+            attention_mask = None
+            labels = None  # labels handled in tree loss wrapper
+        elif self.use_sequence_packing:
             input_ids, packed_seq_params, cu_seqlens, cu_seqlens_padded = self._pack_sequences(
                 input_ids, attention_mask,
             )
@@ -466,7 +513,48 @@ class MegatronInferStrategy(InferenceStrategy):
             packed_seq_params=packed_seq_params, **forward_args
         )
 
-        if self.use_sequence_packing:
+        # NOTE: tree attention hooks are removed in loss_wrapper (after backward)
+        # because gradient checkpointing re-runs forward layers during backward.
+
+        if _tree_meta is not None:
+            # Tree attention loss wrapper: unpack linearized output to per-sample
+            from roll.utils.tree_attention_megatron import unpack_tree_output
+
+            _tree_meta_captured = _tree_meta
+            _tree_cu_pad_captured = _tree_cu_pad
+
+            def loss_wrapper(output_tensor):
+                # NOTE: Do NOT remove hooks here! Gradient checkpointing re-runs
+                # forward layers during backward, so hooks must stay active.
+                # Hooks are cleaned up after forward_backward_func returns.
+
+                # Unpack tree output: [1, packed_len, hidden] → [N, seq_len, hidden]
+                unpacked = unpack_tree_output(output_tensor, _tree_meta_captured, _tree_cu_pad_captured)
+                loss_result = torch.tensor(0.0, device=output_tensor.device)
+                metrics_result_list = []
+                for i in range(_tree_meta_captured.num_branches):
+                    single_output = unpacked[i : i + 1]  # [1, seq_len, hidden]
+                    single_data = data[i : i + 1]
+                    full_seq_len = single_output.size(1)
+                    for key, val in single_data.batch.items():
+                        single_data.batch[key] = adjust_sequence_length(
+                            val, full_seq_len, self.seq_length,
+                            pad_value=IGNORE_INDEX if key in {'labels', 'labels_for_loss'} else 0,
+                        )
+                    loss, metrics = loss_func(single_data, single_output)
+                    loss_result += loss
+                    for key, val in metrics.items():
+                        if isinstance(val, torch.Tensor):
+                            metrics[key] = adjust_sequence_length(val, self.seq_length, full_seq_len, pad_value=0)
+                    metrics_result_list.append(metrics)
+                metrics_result_dict = collate_fn_to_dict_list(metrics_result_list)
+                if self.worker_config.apply_loss_scale:
+                    loss_result *= data.meta_info['loss_scale']
+
+                return loss_result, reduce_metrics(metrics_result_dict)
+
+            return output_tensor, loss_wrapper
+        elif self.use_sequence_packing:
             cp_size = mpu.get_context_parallel_world_size()
             def loss_wrapper(output_tensor):
                 unpacked_output_iter = self._unpack_sequences(
@@ -1128,6 +1216,16 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             micro_batch_size=mini_batch_size,
             forward_only=False,
         )
+
+        # Clean up tree attention hooks after ALL microbatches' forward+backward complete.
+        # With 1F1B schedule and gradient_accumulation_steps=8, the last microbatch's
+        # hooks are still active. We clean up here before optimizer step.
+        _pending_hooks = getattr(self, '_tree_hooks_pending_cleanup', None)
+        if _pending_hooks:
+            from roll.utils.tree_attention_megatron import remove_tree_attention_hooks
+            remove_tree_attention_hooks(_pending_hooks)
+            _pending_hooks.clear()
+            self._tree_hooks_pending_cleanup = None
 
         # 只有step的时候需要load optimizer states
         self.load_states(include=[OffloadStateType.optimizer_states])
